@@ -287,7 +287,7 @@ class TrainingAgent:
 
     # ── Model loading with fallback ───────────────────────────────────────────
 
-   def _load_with_fallback(
+    def _load_with_fallback(
         self, model_plan: Dict, device: str
     ) -> Tuple[Any, Any, Dict]:
         """Try only the requested model. Halt immediately on failure — no fallback."""
