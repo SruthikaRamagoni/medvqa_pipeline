@@ -44,22 +44,60 @@ class ModelSelectionAgent:
             markdown=False,
         )
 
+    def _detect_resources(self) -> Dict[str, Any]:
+        """Auto-detect available GPU and CPU resources at runtime."""
+        import psutil
+        ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device = "cuda"
+                vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                # Subtract already used memory to get truly available VRAM
+                reserved_gb = torch.cuda.memory_reserved(0) / (1024 ** 3)
+                vram_available_gb = vram_gb - reserved_gb
+                gpu_name = torch.cuda.get_device_name(0)
+                logger.info(f"GPU detected: {gpu_name} | Total VRAM: {vram_gb:.1f}GB | Available: {vram_available_gb:.1f}GB")
+            else:
+                device = "cpu"
+                vram_gb = 0.0
+                vram_available_gb = 0.0
+                logger.info("No GPU detected, using CPU.")
+        except Exception as e:
+            logger.warning(f"Could not detect GPU: {e}. Falling back to CPU.")
+            device = "cpu"
+            vram_gb = 0.0
+            vram_available_gb = 0.0
+
+        logger.info(f"RAM available: {ram_gb:.1f}GB | Device: {device}")
+
+        return {
+            "device":             device,
+            "vram_gb":            vram_available_gb,
+            "ram_gb":             ram_gb,
+        }
+
     def select_model(
         self,
-        vram_gb:      float,
-        ram_gb:       float,
         dataset_size: int,
         modality:     str,
-        device:       str,
     ) -> Dict[str, Any]:
         """
-        Score all candidate models and return a complete model_plan dict.
+        Auto-detect resources, score all candidate models, and return
+        a complete model_plan dict.
 
         Returns:
             Dict with hf_id, name, architecture, vision, loader,
             lora config, batch_size, epochs, learning_rate, precision,
             use_4bit, target_modules, max_seq_len.
         """
+        # Auto-detect resources
+        resources    = self._detect_resources()
+        device       = resources["device"]
+        vram_gb      = resources["vram_gb"]
+        ram_gb       = resources["ram_gb"]
+
         scored = self._score_models(vram_gb, device, dataset_size)
         if not scored:
             scored = [m for m in MODEL_CATALOGUE if m["name"] == "Flan-T5-Base"]
@@ -100,7 +138,7 @@ class ModelSelectionAgent:
             "name":           best["name"],
             "architecture":   best["architecture"],
             "vision":         best["vision"],
-            "loader":         best.get("loader", "auto"),   # ← passed to FeatureEng + Training
+            "loader":         best.get("loader", "auto"),
 
             # Hardware
             "use_4bit":       use_4bit,
@@ -152,8 +190,8 @@ if __name__ == "__main__":
                         format="[%(asctime)s][%(levelname)s] %(message)s")
     agent  = ModelSelectionAgent()
     result = agent.select_model(
-        vram_gb=11.0, ram_gb=63.7,
-        dataset_size=3515, modality="X-Ray", device="cuda",
+        dataset_size=3515,
+        modality="X-Ray",
     )
     print("Model Plan:")
     print(json.dumps(result, indent=2))
