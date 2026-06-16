@@ -286,7 +286,6 @@ class TrainingAgent:
             return None, None
 
     # ── Model loading with fallback ───────────────────────────────────────────
-
     def _load_with_fallback(
         self, model_plan: Dict, device: str
     ) -> Tuple[Any, Any, Dict]:
@@ -311,6 +310,7 @@ class TrainingAgent:
                 f"Selected model '{hf_id}' failed to load. "
                 f"Halting — no fallback will be attempted.\nError: {e}"
             )
+    
     def _load_single(
         self,
         hf_id: str,
