@@ -287,37 +287,30 @@ class TrainingAgent:
 
     # ── Model loading with fallback ───────────────────────────────────────────
 
-    def _load_with_fallback(
+   def _load_with_fallback(
         self, model_plan: Dict, device: str
     ) -> Tuple[Any, Any, Dict]:
-        """Try requested model then fallbacks until one loads."""
-        requested  = {**model_plan, "loader": model_plan.get("loader", "auto")}
-        already    = requested.get("hf_id", "")
-        fallbacks  = [f for f in FALLBACK_MODELS if f["hf_id"] != already]
-        candidates = [requested] + fallbacks
-
-        for candidate in candidates:
-            hf_id = candidate["hf_id"]
-            logger.info(f"[Training] Trying: {hf_id}")
-            try:
-                model, tok = self._load_single(
-                    hf_id=hf_id,
-                    loader_hint=candidate.get("loader", "auto"),
-                    use_4bit=model_plan.get("use_4bit", False),
-                    device=device,
-                    precision=model_plan.get("precision", "fp16"),
-                )
-                logger.info(f"[Training] Loaded: {hf_id}")
-                active = {**model_plan, **candidate}
-                return model, tok, active
-            except Exception as e:
-                logger.warning(f"[Training] {hf_id} failed: {e}")
-
-        raise RuntimeError(
-            "All models failed to load. "
-            "Check internet connection and HuggingFace access."
-        )
-
+        """Try only the requested model. Halt immediately on failure — no fallback."""
+        hf_id = model_plan.get("hf_id", "")
+        if not hf_id:
+            raise RuntimeError("No hf_id specified in model_plan.")
+    
+        logger.info(f"[Training] Loading requested model: {hf_id}")
+        try:
+            model, tok = self._load_single(
+                hf_id=hf_id,
+                loader_hint=model_plan.get("loader", "auto"),
+                use_4bit=model_plan.get("use_4bit", False),
+                device=device,
+                precision=model_plan.get("precision", "fp16"),
+            )
+            logger.info(f"[Training] Loaded: {hf_id}")
+            return model, tok, model_plan
+        except Exception as e:
+            raise RuntimeError(
+                f"Selected model '{hf_id}' failed to load. "
+                f"Halting — no fallback will be attempted.\nError: {e}"
+            )
     def _load_single(
         self,
         hf_id: str,
