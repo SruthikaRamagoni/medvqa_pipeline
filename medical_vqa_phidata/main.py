@@ -165,11 +165,8 @@ def run_pipeline(args) -> PipelineState:
     _banner(logger, "STEP 5 — Model Selection")
     model_sel_agent = ModelSelectionAgent(model_id=m)
     model_plan      = model_sel_agent.select_model(
-        vram_gb=state.vram_gb,
-        ram_gb=state.ram_gb,
         dataset_size=collection_result["records_count"],
         modality=state.modality,
-        device=state.device,
     )
     if epochs_override:
         model_plan["epochs"] = epochs_override
