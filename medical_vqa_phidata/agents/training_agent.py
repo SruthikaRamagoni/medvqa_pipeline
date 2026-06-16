@@ -8,6 +8,12 @@ Adaptive: no hardcoded model. Works with any model family selected
 by ModelSelectionAgent. Uses encoded HF Dataset from FeatureEngineeringAgent.
 
 Uses same PhiData + Groq structure as all other agents in the project.
+
+Changes from previous version:
+  - Removed automatic fallback to lighter models; halts on load failure.
+  - Added InstructBlipForConditionalGeneration to CLASS_MAP (fixes InstructBLIP-Vicuna-7B).
+  - Fixed deprecated torch_dtype kwarg → dtype.
+  - ModelSelectionAgent loader hint "InstructBlipForConditionalGeneration" now respected.
 """
 
 from phi.agent import Agent
@@ -26,50 +32,18 @@ TENSOR_COLUMNS = {
     "input_ids", "attention_mask", "pixel_values",
     "labels", "decoder_input_ids", "token_type_ids",
     "image_patches", "image_sizes", "image_grid_thw",
+    "qformer_input_ids", "qformer_attention_mask",          # InstructBLIP / BLIP-2
 }
-
-# Fallback model chain — lightest first
-FALLBACK_MODELS: List[Dict] = [
-    {
-        "hf_id":          "google/flan-t5-base",
-        "name":           "Flan-T5-Base",
-        "architecture":   "seq2seq",
-        "vision":         False,
-        "target_modules": ["q", "v"],
-        "loader":         "AutoModelForSeq2SeqLM",
-    },
-    {
-        "hf_id":          "google/flan-t5-large",
-        "name":           "Flan-T5-Large",
-        "architecture":   "seq2seq",
-        "vision":         False,
-        "target_modules": ["q", "v"],
-        "loader":         "AutoModelForSeq2SeqLM",
-    },
-    {
-        "hf_id":          "Salesforce/blip2-opt-2.7b",
-        "name":           "BLIP2-OPT-2.7B",
-        "architecture":   "causal",
-        "vision":         True,
-        "target_modules": ["q_proj", "v_proj"],
-        "loader":         "Blip2ForConditionalGeneration",
-    },
-    {
-        "hf_id":          "Qwen/Qwen2-VL-2B-Instruct",
-        "name":           "Qwen2-VL-2B",
-        "architecture":   "causal",
-        "vision":         True,
-        "target_modules": ["q_proj", "v_proj"],
-        "loader":         "AutoModelForVision2Seq",
-    },
-]
 
 
 class TrainingAgent:
     """
     Fine-tunes the selected model on features produced by FeatureEngineeringAgent.
-    Adaptive: loads encoded HF Dataset from disk, applies LoRA, and trains.
-    Falls back to lighter models automatically if the selected one fails.
+    Loads encoded HF Dataset from disk, applies LoRA, and trains.
+
+    STRICT MODE: if the requested model fails to load, the agent halts and
+    returns a failed status — it does NOT silently fall back to a lighter model.
+
     Works both standalone and inside the full pipeline.
     """
 
@@ -128,17 +102,15 @@ class TrainingAgent:
         )
         logger.info(f"[Training] Columns: {train_ds.column_names}")
 
-        # Load model with automatic fallback
+        # Load model — halts on failure, no fallback
         try:
-            model, tokenizer, active_plan = self._load_with_fallback(
-                model_plan, device
-            )
+            model, tokenizer, active_plan = self._load_model(model_plan, device)
         except RuntimeError as e:
             return {
                 "status":          "failed",
                 "message":         str(e),
                 "checkpoint_path": "",
-                "model_used":      "",
+                "model_used":      model_plan.get("hf_id", ""),
             }
 
         hf_id        = active_plan["hf_id"]
@@ -147,7 +119,7 @@ class TrainingAgent:
         lora_r       = active_plan.get("lora_r",        8)
         lora_alpha   = active_plan.get("lora_alpha",    16)
         lora_drop    = active_plan.get("lora_dropout",  0.05)
-        target_mods  = active_plan.get("target_modules",["q", "v"])
+        target_mods  = active_plan.get("target_modules", ["q", "v"])
         batch_size   = active_plan.get("batch_size",    2)
         epochs       = active_plan.get("epochs",        3)
         lr           = active_plan.get("learning_rate", 2e-4)
@@ -225,7 +197,7 @@ class TrainingAgent:
         sys.path.insert(0, str(Path(__file__).parent.parent))
         from agents.feature_engineering_agent import FeatureEngineeringAgent
 
-        fe_agent = FeatureEngineeringAgent()
+        fe_agent  = FeatureEngineeringAgent()
         fe_result = fe_agent.engineer_features(
             processed_data_path, model_plan, device or self._detect_device()
         )
@@ -243,8 +215,8 @@ class TrainingAgent:
     def _detect_device(self) -> str:
         try:
             import torch
-            if torch.cuda.is_available():          return "cuda"
-            if torch.backends.mps.is_available():  return "mps"
+            if torch.cuda.is_available():         return "cuda"
+            if torch.backends.mps.is_available(): return "mps"
         except ImportError:
             pass
         return "cpu"
@@ -285,15 +257,19 @@ class TrainingAgent:
             logger.error(f"[Training] Feature dataset load failed: {e}")
             return None, None
 
-    # ── Model loading with fallback ───────────────────────────────────────────
-    def _load_with_fallback(
+    # ── Model loading — strict, no fallback ───────────────────────────────────
+
+    def _load_model(
         self, model_plan: Dict, device: str
     ) -> Tuple[Any, Any, Dict]:
-        """Try only the requested model. Halt immediately on failure — no fallback."""
+        """
+        Load exactly the model specified in model_plan.
+        Raises RuntimeError immediately on failure — no fallback attempted.
+        """
         hf_id = model_plan.get("hf_id", "")
         if not hf_id:
             raise RuntimeError("No hf_id specified in model_plan.")
-    
+
         logger.info(f"[Training] Loading requested model: {hf_id}")
         try:
             model, tok = self._load_single(
@@ -303,14 +279,14 @@ class TrainingAgent:
                 device=device,
                 precision=model_plan.get("precision", "fp16"),
             )
-            logger.info(f"[Training] Loaded: {hf_id}")
+            logger.info(f"[Training] Successfully loaded: {hf_id}")
             return model, tok, model_plan
         except Exception as e:
             raise RuntimeError(
                 f"Selected model '{hf_id}' failed to load. "
                 f"Halting — no fallback will be attempted.\nError: {e}"
             )
-    
+
     def _load_single(
         self,
         hf_id: str,
@@ -322,6 +298,7 @@ class TrainingAgent:
         import torch
         import transformers as tf
 
+        # FIX: use `dtype` instead of deprecated `torch_dtype`
         dtype = (
             torch.float16
             if precision == "fp16" and device == "cuda"
@@ -343,20 +320,36 @@ class TrainingAgent:
             )
             load_kw["device_map"] = "auto"
         elif device == "cuda":
-            load_kw["torch_dtype"] = dtype
-            load_kw["device_map"]  = "auto"
+            load_kw["dtype"]      = dtype          # FIX: was torch_dtype
+            load_kw["device_map"] = "auto"
         else:
-            load_kw["torch_dtype"] = dtype
+            load_kw["dtype"]      = dtype          # FIX: was torch_dtype
 
-        CLASS_MAP = {
-            "AutoModelForSeq2SeqLM":        ["AutoModelForSeq2SeqLM"],
-            "Blip2ForConditionalGeneration": ["Blip2ForConditionalGeneration",
-                                              "AutoModelForVision2Seq"],
-            "AutoModelForVision2Seq":        ["AutoModelForVision2Seq",
-                                              "AutoModelForCausalLM"],
-            "auto":                          ["AutoModelForSeq2SeqLM",
-                                              "AutoModelForVision2Seq",
-                                              "AutoModelForCausalLM"],
+        # CLASS_MAP: maps loader_hint → ordered list of classes to try.
+        # InstructBlipForConditionalGeneration added to fix InstructBLIP-Vicuna/FlanT5.
+        CLASS_MAP: Dict[str, List[str]] = {
+            "AutoModelForSeq2SeqLM": [
+                "AutoModelForSeq2SeqLM",
+            ],
+            "Blip2ForConditionalGeneration": [
+                "Blip2ForConditionalGeneration",
+                "AutoModelForVision2Seq",
+            ],
+            "InstructBlipForConditionalGeneration": [    # FIX: new entry
+                "InstructBlipForConditionalGeneration",
+                "AutoModelForVision2Seq",
+            ],
+            "AutoModelForVision2Seq": [
+                "AutoModelForVision2Seq",
+                "AutoModelForCausalLM",
+            ],
+            "auto": [
+                "InstructBlipForConditionalGeneration",  # FIX: added to auto chain
+                "Blip2ForConditionalGeneration",
+                "AutoModelForSeq2SeqLM",
+                "AutoModelForVision2Seq",
+                "AutoModelForCausalLM",
+            ],
         }
         class_order = CLASS_MAP.get(loader_hint, CLASS_MAP["auto"])
 
@@ -365,6 +358,7 @@ class TrainingAgent:
         for cls_name in class_order:
             cls = getattr(tf, cls_name, None)
             if cls is None:
+                logger.debug(f"[Training] Class {cls_name} not found in transformers — skipping.")
                 continue
             try:
                 model = cls.from_pretrained(**load_kw)
@@ -372,7 +366,7 @@ class TrainingAgent:
                 break
             except Exception as e:
                 last_error = e
-                logger.debug(f"[Training] {cls_name} failed: {e}")
+                logger.debug(f"[Training] {cls_name} failed for {hf_id}: {e}")
 
         if model is None:
             raise RuntimeError(
@@ -383,8 +377,10 @@ class TrainingAgent:
         for method in ("gradient_checkpointing_enable", "enable_input_require_grads"):
             fn = getattr(model, method, None)
             if fn:
-                try: fn()
-                except Exception: pass
+                try:
+                    fn()
+                except Exception:
+                    pass
 
         # Load tokenizer / processor
         tokenizer = None
@@ -426,7 +422,9 @@ class TrainingAgent:
             )
             model = get_peft_model(model, cfg)
             model.print_trainable_parameters()
-            logger.info(f"[Training] LoRA applied: r={r}  alpha={alpha}  task={task_type}")
+            logger.info(
+                f"[Training] LoRA applied: r={r}  alpha={alpha}  task={task_type}"
+            )
         except ImportError:
             logger.warning("[Training] PEFT not installed — training without LoRA.")
         except Exception as e:
@@ -438,15 +436,18 @@ class TrainingAgent:
     def _prepare_columns(self, train_ds, val_ds):
         """
         Keep only tensor-compatible columns. Add labels if missing.
-        Also flattens any nested list columns that cause unpack errors.
+        Also flattens any nested pixel_values that cause unpack errors.
+        qformer_input_ids and qformer_attention_mask are preserved for
+        InstructBLIP / BLIP-2 models.
         """
-        import numpy as np
-
         # ── Drop non-tensor columns ───────────────────────────────────────────
         drop_tr = [c for c in train_ds.column_names if c not in TENSOR_COLUMNS]
         drop_vl = [c for c in val_ds.column_names   if c not in TENSOR_COLUMNS]
-        if drop_tr: train_ds = train_ds.remove_columns(drop_tr)
-        if drop_vl: val_ds   = val_ds.remove_columns(drop_vl)
+        if drop_tr:
+            logger.info(f"[Training] Dropping non-tensor columns: {drop_tr}")
+            train_ds = train_ds.remove_columns(drop_tr)
+        if drop_vl:
+            val_ds = val_ds.remove_columns(drop_vl)
 
         # ── Add labels if missing ─────────────────────────────────────────────
         if ("labels"    not in train_ds.column_names and
@@ -465,10 +466,10 @@ class TrainingAgent:
         if "pixel_values" in train_ds.column_names:
             try:
                 sample = train_ds[0]["pixel_values"]
-                # If it is a nested list (list of lists), leave as-is —
-                # DataCollator will handle it. Only flatten if it is
-                # a plain Python list wrapped in an extra list.
-                if isinstance(sample, list) and len(sample) == 1 and isinstance(sample[0], list):
+                # Only unwrap if it's a plain Python list wrapped in an extra list.
+                if (isinstance(sample, list) and
+                        len(sample) == 1 and
+                        isinstance(sample[0], list)):
                     def unwrap_pixel(batch):
                         return {"pixel_values": [pv[0] for pv in batch["pixel_values"]]}
                     train_ds = train_ds.map(unwrap_pixel, batched=True)
@@ -520,11 +521,11 @@ class TrainingAgent:
         )
 
         # transformers >= 4.46 renamed tokenizer → processing_class
-        ver      = tuple(int(x) for x in transformers.__version__.split(".")[:2])
+        ver       = tuple(int(x) for x in transformers.__version__.split(".")[:2])
         tok_kwarg = "processing_class" if ver >= (4, 46) else "tokenizer"
 
-        # Use DataCollatorWithPadding for text models
-        # Use default_data_collator for vision models (pixel_values present)
+        # Use default_data_collator for vision models (pixel_values present),
+        # DataCollatorWithPadding otherwise.
         from transformers import default_data_collator
         has_pixels = "pixel_values" in train_ds.column_names
 
@@ -622,15 +623,16 @@ if __name__ == "__main__":
         print(f"VRAM   : {vram:.1f} GB")
 
     plan = {
-        "hf_id":          "google/flan-t5-base",
-        "name":           "Flan-T5-Base",
-        "architecture":   "seq2seq",
-        "vision":         False,
+        "hf_id":          "Salesforce/instructblip-vicuna-7b",
+        "name":           "InstructBLIP-Vicuna-7B",
+        "architecture":   "causal",
+        "vision":         True,
+        "loader":         "InstructBlipForConditionalGeneration",
         "use_4bit":       False,
         "lora_r":         8,
         "lora_alpha":     16,
         "lora_dropout":   0.05,
-        "target_modules": ["q", "v"],
+        "target_modules": ["q_proj", "v_proj"],
         "batch_size":     2,
         "epochs":         1,
         "learning_rate":  2e-4,
@@ -640,7 +642,7 @@ if __name__ == "__main__":
     agent = TrainingAgent()
 
     # Check for pre-encoded features first
-    feature_path = f"./data/features/{plan['hf_id'].replace('/','_')}"
+    feature_path   = f"./data/features/{plan['hf_id'].replace('/','_')}"
     processed_path = "./data/processed/processed_dataset.jsonl"
 
     if Path(feature_path).exists():
@@ -650,12 +652,12 @@ if __name__ == "__main__":
         print(f"\nEncoding from processed data: {processed_path}")
         result = agent.train_from_processed(processed_path, plan, device=device)
     else:
-        print(f"\nNo data found. Run full pipeline first:")
+        print("\nNo data found. Run full pipeline first:")
         print("  python main.py --image image.jpg --question 'Is there pneumonia?' --dry-run")
         result = {}
 
     if result:
-        print("\n" + "="*50)
+        print("\n" + "=" * 50)
         print("Training Result:")
         print(json.dumps(result, indent=2, default=str))
-        print("="*50)
+        print("=" * 50)
