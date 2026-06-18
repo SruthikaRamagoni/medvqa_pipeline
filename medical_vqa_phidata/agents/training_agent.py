@@ -4,16 +4,18 @@ agents/training_agent.py
 TrainingAgent — loads encoded features from FeatureEngineeringAgent
 and fine-tunes the selected model using PEFT/LoRA.
 
-Adaptive: no hardcoded model. Works with any model family selected
-by ModelSelectionAgent. Uses encoded HF Dataset from FeatureEngineeringAgent.
-
-Uses same PhiData + Groq structure as all other agents in the project.
-
 Changes from previous version:
-  - Removed automatic fallback to lighter models; halts on load failure.
-  - Added InstructBlipForConditionalGeneration to CLASS_MAP (fixes InstructBLIP-Vicuna-7B).
-  - Fixed deprecated torch_dtype kwarg → dtype.
-  - ModelSelectionAgent loader hint "InstructBlipForConditionalGeneration" now respected.
+  - Early stopping: training halts automatically when eval loss stops
+    improving (patience controlled by plan or default 2 epochs).
+  - LR scheduler: cosine decay with warmup so the model learns fast
+    early and fine-tunes carefully at the end.
+  - Gradient clipping: max_grad_norm applied per step to prevent
+    instability on difficult medical images (default 1.0, configurable).
+  - On training failure, `failure_reason` key is added to the return dict
+    so CoordinatorAgent / main.py can feed it straight into
+    ModelSelectionAgent.select_model(failure_context=…) for a retry.
+  - All other behaviour (PhiData + Groq pattern, CLASS_MAP,
+    HF_ID_OVERRIDES, strict-no-fallback loading) is unchanged.
 """
 
 from phi.agent import Agent
@@ -32,8 +34,11 @@ TENSOR_COLUMNS = {
     "input_ids", "attention_mask", "pixel_values",
     "labels", "decoder_input_ids", "token_type_ids",
     "image_patches", "image_sizes", "image_grid_thw",
-    "qformer_input_ids", "qformer_attention_mask",          # InstructBLIP / BLIP-2
+    "qformer_input_ids", "qformer_attention_mask",
 }
+
+# Optional per-model hf_id overrides (populated by ModelSelectionAgent hints)
+HF_ID_OVERRIDES: Dict[str, str] = {}
 
 
 class TrainingAgent:
@@ -44,7 +49,14 @@ class TrainingAgent:
     STRICT MODE: if the requested model fails to load, the agent halts and
     returns a failed status — it does NOT silently fall back to a lighter model.
 
-    Works both standalone and inside the full pipeline.
+    New in this version:
+      • Early stopping via EarlyStoppingCallback (patience = plan early_stopping_patience,
+        default 2).  Set to 0 in the plan to disable.
+      • Cosine LR scheduler with linear warmup.
+      • Gradient clipping via max_grad_norm (default 1.0, configurable in plan).
+
+    Return dict always includes `failure_reason` (empty string on success) so
+    the Coordinator can pass it directly to ModelSelectionAgent for a retry.
     """
 
     def __init__(self, model_id: str = "mistral"):
@@ -67,8 +79,8 @@ class TrainingAgent:
     def train(
         self,
         feature_path: str,
-        model_plan: Dict[str, Any],
-        device: str = "",
+        model_plan:   Dict[str, Any],
+        device:       str = "",
     ) -> Dict[str, Any]:
         """
         Fine-tune the model using pre-encoded feature dataset.
@@ -80,94 +92,86 @@ class TrainingAgent:
             device       : 'cuda' | 'cpu' | '' (auto-detect).
 
         Returns:
-            Dict with checkpoint_path, train_loss, status, model_used.
+            Dict with checkpoint_path, train_loss, status, model_used,
+            and failure_reason (empty string on success).
         """
         if not device:
             device = self._detect_device()
         logger.info(f"[Training] Device: {device}")
 
-        # Load encoded datasets from FeatureEngineeringAgent output
         train_ds, val_ds = self._load_feature_datasets(feature_path)
 
         if train_ds is None or len(train_ds) == 0:
-            return {
-                "status":          "failed",
-                "message":         f"No encoded training data found at: {feature_path}",
-                "checkpoint_path": "",
-                "model_used":      "",
-            }
+            return self._fail(
+                f"No encoded training data found at: {feature_path}",
+                model_used="",
+            )
 
         logger.info(
             f"[Training] Loaded → Train={len(train_ds)}  Val={len(val_ds)}"
         )
         logger.info(f"[Training] Columns: {train_ds.column_names}")
 
-        # Load model — halts on failure, no fallback
         try:
             model, tokenizer, active_plan = self._load_model(model_plan, device)
         except RuntimeError as e:
-            return {
-                "status":          "failed",
-                "message":         str(e),
-                "checkpoint_path": "",
-                "model_used":      model_plan.get("hf_id", ""),
-            }
+            return self._fail(str(e), model_used=model_plan.get("hf_id", ""))
 
         hf_id        = active_plan["hf_id"]
         name         = active_plan["name"]
-        architecture = active_plan.get("architecture", "seq2seq")
-        lora_r       = active_plan.get("lora_r",        8)
-        lora_alpha   = active_plan.get("lora_alpha",    16)
-        lora_drop    = active_plan.get("lora_dropout",  0.05)
-        target_mods  = active_plan.get("target_modules", ["q", "v"])
-        batch_size   = active_plan.get("batch_size",    2)
-        epochs       = active_plan.get("epochs",        3)
-        lr           = active_plan.get("learning_rate", 2e-4)
-        precision    = active_plan.get("precision",     "fp16")
+        architecture = active_plan.get("architecture",          "seq2seq")
+        lora_r       = active_plan.get("lora_r",                8)
+        lora_alpha   = active_plan.get("lora_alpha",            16)
+        lora_drop    = active_plan.get("lora_dropout",          0.05)
+        target_mods  = active_plan.get("target_modules",        ["q", "v"])
+        batch_size   = active_plan.get("batch_size",            2)
+        epochs       = active_plan.get("epochs",                3)
+        lr           = active_plan.get("learning_rate",         2e-4)
+        precision    = active_plan.get("precision",             "fp16")
+        # ── New configurable training knobs ──────────────────────────────────
+        max_grad_norm    = active_plan.get("max_grad_norm",               1.0)
+        es_patience      = active_plan.get("early_stopping_patience",     2)
+        lr_scheduler     = active_plan.get("lr_scheduler_type",           "cosine")
 
-        # Output checkpoint directory
         safe_name = name.replace(" ", "_").replace("/", "_")
         out_dir   = CHECKPOINT_DIR / safe_name
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Apply LoRA adapters
         model = self._apply_lora(
             model, lora_r, lora_alpha, lora_drop, target_mods, architecture
         )
 
-        # Prepare columns for Trainer
         train_ds, val_ds = self._prepare_columns(train_ds, val_ds)
 
         if len(train_ds) == 0:
-            return {
-                "status":          "failed",
-                "message":         "No valid tensor columns after column preparation.",
-                "checkpoint_path": str(out_dir),
-                "model_used":      hf_id,
-            }
+            return self._fail(
+                "No valid tensor columns after column preparation.",
+                model_used=hf_id,
+                checkpoint_path=str(out_dir),
+            )
 
-        # Build Trainer and run training
         try:
-            trainer    = self._build_trainer(
+            trainer = self._build_trainer(
                 model, tokenizer, train_ds, val_ds,
-                str(out_dir), batch_size, epochs, lr, precision, device,
+                str(out_dir), batch_size, epochs, lr,
+                precision, device,
+                max_grad_norm=max_grad_norm,
+                es_patience=es_patience,
+                lr_scheduler=lr_scheduler,
             )
             metrics    = self._run_training(trainer)
             train_loss = round(float(metrics.get("train_loss", 0.0)), 4)
         except Exception as e:
             logger.error(f"[Training] Training failed: {e}")
-            return {
-                "status":          "failed",
-                "message":         f"Training loop error: {e}",
-                "checkpoint_path": str(out_dir),
-                "model_used":      hf_id,
-            }
+            return self._fail(
+                f"Training loop error: {e}",
+                model_used=hf_id,
+                checkpoint_path=str(out_dir),
+            )
 
-        # Save checkpoint
         self._save(model, tokenizer, str(out_dir), active_plan)
         logger.info(f"[Training] Complete. Loss={train_loss}  Ckpt={out_dir}")
 
-        # Groq assessment
         assessment = self._get_llm_assessment(
             hf_id, lora_r, lora_alpha, epochs,
             batch_size, lr, train_loss, out_dir,
@@ -175,6 +179,7 @@ class TrainingAgent:
         assessment["checkpoint_path"] = str(out_dir)
         assessment["model_used"]      = hf_id
         assessment["train_loss"]      = str(train_loss)
+        assessment["failure_reason"]  = ""          # success — no failure
         return assessment
 
     # ── Compatibility method ──────────────────────────────────────────────────
@@ -182,8 +187,8 @@ class TrainingAgent:
     def train_from_processed(
         self,
         processed_data_path: str,
-        model_plan: Dict[str, Any],
-        device: str = "",
+        model_plan:          Dict[str, Any],
+        device:              str = "",
     ) -> Dict[str, Any]:
         """
         Fallback: if FeatureEngineeringAgent was not run, encode inline.
@@ -202,15 +207,32 @@ class TrainingAgent:
             processed_data_path, model_plan, device or self._detect_device()
         )
         if fe_result.get("status") == "failed":
-            return {
-                "status":          "failed",
-                "message":         f"Inline feature engineering failed: {fe_result.get('message')}",
-                "checkpoint_path": "",
-                "model_used":      "",
-            }
+            return self._fail(
+                f"Inline feature engineering failed: {fe_result.get('message')}",
+                model_used="",
+            )
         return self.train(fe_result["feature_path"], model_plan, device)
 
-    # ── Device ────────────────────────────────────────────────────────────────
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _fail(
+        self,
+        message:         str,
+        model_used:      str = "",
+        checkpoint_path: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Unified failure return.  Always includes `failure_reason` so the
+        Coordinator can pass it to ModelSelectionAgent without extra checks.
+        """
+        logger.error(f"[Training] FAILED — {message}")
+        return {
+            "status":          "failed",
+            "message":         message,
+            "checkpoint_path": checkpoint_path,
+            "model_used":      model_used,
+            "failure_reason":  message,   # ← key used by retry logic
+        }
 
     def _detect_device(self) -> str:
         try:
@@ -224,13 +246,8 @@ class TrainingAgent:
     # ── Load encoded datasets ─────────────────────────────────────────────────
 
     def _load_feature_datasets(self, feature_path: str):
-        """
-        Load HuggingFace Datasets saved by FeatureEngineeringAgent.
-        Returns (train_ds, val_ds) or (None, None) on failure.
-        """
         if not feature_path or not Path(feature_path).exists():
             return None, None
-
         try:
             from datasets import load_from_disk
 
@@ -245,14 +262,12 @@ class TrainingAgent:
             val_ds   = load_from_disk(str(val_path)) if val_path.exists() else None
 
             if val_ds is None or len(val_ds) == 0:
-                # Create val split from train if missing
                 split    = train_ds.train_test_split(test_size=0.1, seed=42)
                 train_ds = split["train"]
                 val_ds   = split["test"]
                 logger.info("[Training] Created val split from train (10%).")
 
             return train_ds, val_ds
-
         except Exception as e:
             logger.error(f"[Training] Feature dataset load failed: {e}")
             return None, None
@@ -262,25 +277,25 @@ class TrainingAgent:
     def _load_model(
         self, model_plan: Dict, device: str
     ) -> Tuple[Any, Any, Dict]:
-        """
-        Load exactly the model specified in model_plan.
-        Raises RuntimeError immediately on failure — no fallback attempted.
-        """
         hf_id = model_plan.get("hf_id", "")
         if not hf_id:
             raise RuntimeError("No hf_id specified in model_plan.")
+
+        # Apply any runtime overrides
+        hf_id = HF_ID_OVERRIDES.get(hf_id, hf_id)
+        effective_plan = {**model_plan, "hf_id": hf_id}
 
         logger.info(f"[Training] Loading requested model: {hf_id}")
         try:
             model, tok = self._load_single(
                 hf_id=hf_id,
-                loader_hint=model_plan.get("loader", "auto"),
-                use_4bit=model_plan.get("use_4bit", False),
+                loader_hint=effective_plan.get("loader", "auto"),
+                use_4bit=effective_plan.get("use_4bit", False),
                 device=device,
-                precision=model_plan.get("precision", "fp16"),
+                precision=effective_plan.get("precision", "fp16"),
             )
             logger.info(f"[Training] Successfully loaded: {hf_id}")
-            return model, tok, model_plan
+            return model, tok, effective_plan
         except Exception as e:
             raise RuntimeError(
                 f"Selected model '{hf_id}' failed to load. "
@@ -289,16 +304,15 @@ class TrainingAgent:
 
     def _load_single(
         self,
-        hf_id: str,
+        hf_id:       str,
         loader_hint: str,
-        use_4bit: bool,
-        device: str,
-        precision: str,
+        use_4bit:    bool,
+        device:      str,
+        precision:   str,
     ) -> Tuple[Any, Any]:
         import torch
         import transformers as tf
 
-        # FIX: use `dtype` instead of deprecated `torch_dtype`
         dtype = (
             torch.float16
             if precision == "fp16" and device == "cuda"
@@ -320,13 +334,11 @@ class TrainingAgent:
             )
             load_kw["device_map"] = "auto"
         elif device == "cuda":
-            load_kw["dtype"]      = dtype          # FIX: was torch_dtype
+            load_kw["dtype"]      = dtype
             load_kw["device_map"] = "auto"
         else:
-            load_kw["dtype"]      = dtype          # FIX: was torch_dtype
+            load_kw["dtype"] = dtype
 
-        # CLASS_MAP: maps loader_hint → ordered list of classes to try.
-        # InstructBlipForConditionalGeneration added to fix InstructBLIP-Vicuna/FlanT5.
         CLASS_MAP: Dict[str, List[str]] = {
             "AutoModelForSeq2SeqLM": [
                 "AutoModelForSeq2SeqLM",
@@ -335,7 +347,7 @@ class TrainingAgent:
                 "Blip2ForConditionalGeneration",
                 "AutoModelForVision2Seq",
             ],
-            "InstructBlipForConditionalGeneration": [    # FIX: new entry
+            "InstructBlipForConditionalGeneration": [
                 "InstructBlipForConditionalGeneration",
                 "AutoModelForVision2Seq",
             ],
@@ -344,7 +356,7 @@ class TrainingAgent:
                 "AutoModelForCausalLM",
             ],
             "auto": [
-                "InstructBlipForConditionalGeneration",  # FIX: added to auto chain
+                "InstructBlipForConditionalGeneration",
                 "Blip2ForConditionalGeneration",
                 "AutoModelForSeq2SeqLM",
                 "AutoModelForVision2Seq",
@@ -358,7 +370,9 @@ class TrainingAgent:
         for cls_name in class_order:
             cls = getattr(tf, cls_name, None)
             if cls is None:
-                logger.debug(f"[Training] Class {cls_name} not found in transformers — skipping.")
+                logger.debug(
+                    f"[Training] Class {cls_name} not in transformers — skipping."
+                )
                 continue
             try:
                 model = cls.from_pretrained(**load_kw)
@@ -373,7 +387,6 @@ class TrainingAgent:
                 f"Cannot load {hf_id}. Last error: {last_error}"
             )
 
-        # Enable gradient checkpointing
         for method in ("gradient_checkpointing_enable", "enable_input_require_grads"):
             fn = getattr(model, method, None)
             if fn:
@@ -382,7 +395,6 @@ class TrainingAgent:
                 except Exception:
                     pass
 
-        # Load tokenizer / processor
         tokenizer = None
         try:
             from transformers import AutoProcessor
@@ -434,13 +446,6 @@ class TrainingAgent:
     # ── Column preparation ────────────────────────────────────────────────────
 
     def _prepare_columns(self, train_ds, val_ds):
-        """
-        Keep only tensor-compatible columns. Add labels if missing.
-        Also flattens any nested pixel_values that cause unpack errors.
-        qformer_input_ids and qformer_attention_mask are preserved for
-        InstructBLIP / BLIP-2 models.
-        """
-        # ── Drop non-tensor columns ───────────────────────────────────────────
         drop_tr = [c for c in train_ds.column_names if c not in TENSOR_COLUMNS]
         drop_vl = [c for c in val_ds.column_names   if c not in TENSOR_COLUMNS]
         if drop_tr:
@@ -449,7 +454,6 @@ class TrainingAgent:
         if drop_vl:
             val_ds = val_ds.remove_columns(drop_vl)
 
-        # ── Add labels if missing ─────────────────────────────────────────────
         if ("labels"    not in train_ds.column_names and
                 "input_ids" in  train_ds.column_names):
             train_ds = train_ds.map(
@@ -459,14 +463,9 @@ class TrainingAgent:
                 lambda x: {"labels": x["input_ids"]}, batched=True
             )
 
-        # ── Flatten nested pixel_values if present ────────────────────────────
-        # InstructBLIP / BLIP-2 encode pixel_values as list-of-list-of-list.
-        # HuggingFace Trainer needs it as a flat list or numpy array.
-        # We detect and flatten here to prevent "too many values to unpack".
         if "pixel_values" in train_ds.column_names:
             try:
                 sample = train_ds[0]["pixel_values"]
-                # Only unwrap if it's a plain Python list wrapped in an extra list.
                 if (isinstance(sample, list) and
                         len(sample) == 1 and
                         isinstance(sample[0], list)):
@@ -484,12 +483,30 @@ class TrainingAgent:
     # ── Trainer ───────────────────────────────────────────────────────────────
 
     def _build_trainer(
-        self, model, tok, train_ds, val_ds,
-        out_dir, batch_size, epochs, lr, precision, device,
+        self,
+        model,     tok,
+        train_ds,  val_ds,
+        out_dir,   batch_size,
+        epochs,    lr,
+        precision, device,
+        # ── new knobs ─────────────────────────────────────────────────────────
+        max_grad_norm: float = 1.0,
+        es_patience:   int   = 2,
+        lr_scheduler:  str   = "cosine",
     ):
+        """
+        Build a HuggingFace Trainer with:
+          • cosine LR scheduler + linear warmup
+          • gradient clipping (max_grad_norm)
+          • early stopping (EarlyStoppingCallback, patience=es_patience)
+        """
         import torch
         import transformers
-        from transformers import TrainingArguments, Trainer
+        from transformers import (
+            TrainingArguments, Trainer,
+            EarlyStoppingCallback,
+            default_data_collator,
+        )
 
         use_fp16 = precision == "fp16" and torch.cuda.is_available()
         use_bf16 = False
@@ -497,7 +514,15 @@ class TrainingAgent:
             if torch.cuda.get_device_properties(0).major >= 8:
                 use_bf16, use_fp16 = True, False
 
-        warmup = min(100, max(1, len(train_ds) // batch_size // 10))
+        steps_per_epoch = max(1, len(train_ds) // batch_size)
+        warmup_steps    = min(100, max(1, steps_per_epoch // 10))
+        logging_steps   = max(1, steps_per_epoch // 5)
+
+        logger.info(
+            f"[Training] Scheduler={lr_scheduler}  "
+            f"Warmup={warmup_steps}  MaxGradNorm={max_grad_norm}  "
+            f"EarlyStopPatience={es_patience}"
+        )
 
         args = TrainingArguments(
             output_dir=out_dir,
@@ -508,26 +533,36 @@ class TrainingAgent:
             fp16=use_fp16,
             bf16=use_bf16,
             gradient_accumulation_steps=4 if batch_size <= 2 else 2,
-            warmup_steps=warmup,
+            warmup_steps=warmup_steps,
             weight_decay=0.01,
-            logging_steps=max(1, len(train_ds) // batch_size // 5),
+            logging_steps=logging_steps,
             eval_strategy="epoch",
             save_strategy="epoch",
             load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
             remove_unused_columns=False,
             report_to="none",
             dataloader_num_workers=0,
-            max_grad_norm=1.0,
+            # ── gradient clipping ─────────────────────────────────────────────
+            max_grad_norm=max_grad_norm,
+            # ── LR scheduler ──────────────────────────────────────────────────
+            lr_scheduler_type=lr_scheduler,   # "cosine" by default
         )
 
         # transformers >= 4.46 renamed tokenizer → processing_class
         ver       = tuple(int(x) for x in transformers.__version__.split(".")[:2])
         tok_kwarg = "processing_class" if ver >= (4, 46) else "tokenizer"
 
-        # Use default_data_collator for vision models (pixel_values present),
-        # DataCollatorWithPadding otherwise.
-        from transformers import default_data_collator
         has_pixels = "pixel_values" in train_ds.column_names
+
+        # Build callbacks list — add EarlyStoppingCallback only when patience > 0
+        callbacks = []
+        if es_patience > 0:
+            callbacks.append(EarlyStoppingCallback(early_stopping_patience=es_patience))
+            logger.info(
+                f"[Training] Early stopping enabled (patience={es_patience})."
+            )
 
         if has_pixels:
             return Trainer(
@@ -536,6 +571,7 @@ class TrainingAgent:
                 train_dataset=train_ds,
                 eval_dataset=val_ds,
                 data_collator=default_data_collator,
+                callbacks=callbacks if callbacks else None,
             )
         else:
             return Trainer(
@@ -543,6 +579,7 @@ class TrainingAgent:
                 args=args,
                 train_dataset=train_ds,
                 eval_dataset=val_ds,
+                callbacks=callbacks if callbacks else None,
                 **{tok_kwarg: tok},
             )
 
@@ -623,25 +660,28 @@ if __name__ == "__main__":
         print(f"VRAM   : {vram:.1f} GB")
 
     plan = {
-        "hf_id":          "Salesforce/instructblip-vicuna-7b",
-        "name":           "InstructBLIP-Vicuna-7B",
-        "architecture":   "causal",
-        "vision":         True,
-        "loader":         "InstructBlipForConditionalGeneration",
-        "use_4bit":       False,
-        "lora_r":         8,
-        "lora_alpha":     16,
-        "lora_dropout":   0.05,
-        "target_modules": ["q_proj", "v_proj"],
-        "batch_size":     2,
-        "epochs":         1,
-        "learning_rate":  2e-4,
-        "precision":      "fp16",
+        "hf_id":                      "Salesforce/instructblip-vicuna-7b",
+        "name":                       "InstructBLIP-Vicuna-7B",
+        "architecture":               "causal",
+        "vision":                     True,
+        "loader":                     "InstructBlipForConditionalGeneration",
+        "use_4bit":                   False,
+        "lora_r":                     8,
+        "lora_alpha":                 16,
+        "lora_dropout":               0.05,
+        "target_modules":             ["q_proj", "v_proj"],
+        "batch_size":                 2,
+        "epochs":                     3,
+        "learning_rate":              2e-4,
+        "precision":                  "fp16",
+        # ── new training knobs ───────────────────────────────────────────────
+        "max_grad_norm":              1.0,   # gradient clipping
+        "early_stopping_patience":    2,     # 0 = disabled
+        "lr_scheduler_type":          "cosine",
     }
 
     agent = TrainingAgent()
 
-    # Check for pre-encoded features first
     feature_path   = f"./data/features/{plan['hf_id'].replace('/','_')}"
     processed_path = "./data/processed/processed_dataset.jsonl"
 
@@ -653,7 +693,10 @@ if __name__ == "__main__":
         result = agent.train_from_processed(processed_path, plan, device=device)
     else:
         print("\nNo data found. Run full pipeline first:")
-        print("  python main.py --image image.jpg --question 'Is there pneumonia?' --dry-run")
+        print(
+            "  python main.py --image image.jpg "
+            "--question 'Is there pneumonia?' --dry-run"
+        )
         result = {}
 
     if result:
@@ -661,3 +704,21 @@ if __name__ == "__main__":
         print("Training Result:")
         print(json.dumps(result, indent=2, default=str))
         print("=" * 50)
+
+        # Demo: how to pass failure_reason back to ModelSelectionAgent for retry
+        if result.get("status") == "failed":
+            print("\n[Demo] Passing failure context to ModelSelectionAgent …")
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            from agents.model_selection_agent import ModelSelectionAgent
+
+            selector    = ModelSelectionAgent()
+            retry_plan  = selector.select_model(
+                dataset_size=3515,
+                modality="X-Ray",
+                failure_context={
+                    "failed_hf_id": result.get("model_used", ""),
+                    "reason":       result.get("failure_reason", ""),
+                },
+            )
+            print("\nRetry Model Plan:")
+            print(json.dumps(retry_plan, indent=2, default=str))
