@@ -2,20 +2,54 @@
 agents/training_agent.py
 
 TrainingAgent — loads encoded features from FeatureEngineeringAgent
-and fine-tunes the selected model using PEFT/LoRA.
+and fine-tunes the model selected by ModelSelectionAgent using PEFT/LoRA.
 
-Changes from previous version:
-  - Early stopping: training halts automatically when eval loss stops
-    improving (patience controlled by plan or default 2 epochs).
-  - LR scheduler: cosine decay with warmup so the model learns fast
-    early and fine-tunes carefully at the end.
-  - Gradient clipping: max_grad_norm applied per step to prevent
-    instability on difficult medical images (default 1.0, configurable).
-  - On training failure, `failure_reason` key is added to the return dict
-    so CoordinatorAgent / main.py can feed it straight into
-    ModelSelectionAgent.select_model(failure_context=…) for a retry.
-  - All other behaviour (PhiData + Groq pattern, CLASS_MAP,
-    HF_ID_OVERRIDES, strict-no-fallback loading) is unchanged.
+Changes from previous version (fixes the
+"not enough values to unpack (expected 3, got 1)" crash on Qwen2-VL /
+Qwen2.5-VL training):
+
+  ROOT CAUSE
+  ----------
+  Qwen2-VL / Qwen2.5-VL processors emit `pixel_values` already patchified,
+  per example, as a 2D tensor of shape (num_patches, patch_dim) — e.g.
+  (256, 1176) — NOT the classic (C, H, W) layout that BLIP-2 / InstructBLIP
+  use. They pair this with `image_grid_thw`, shape (3,) per image, telling
+  the vision tower how to reshape the flat patch sequence back into a
+  spatial (t, h, w) grid.
+
+  The previous version always used `default_data_collator` whenever
+  `pixel_values` was present. That collator blindly `torch.stack()`s every
+  column. For Qwen-VL models this is wrong on both fields:
+    - `pixel_values` must be CONCATENATED across the batch (patch counts
+      differ per image), not stacked.
+    - `image_grid_thw` must be stacked into shape (num_images, 3).
+  Naive stacking mangles `image_grid_thw` so the vision tower's internal
+  `t, h, w = grid_thw` unpack receives the wrong number of values —
+  producing exactly "not enough values to unpack (expected 3, got 1)".
+
+  FIX
+  ---
+  1. New `_qwen_vl_collator()` — concatenates `pixel_values`, stacks
+     `image_grid_thw` correctly, stacks the rest normally. Used instead of
+     `default_data_collator` whenever the model family is Qwen-VL.
+  2. `_prepare_columns()` / `_normalize_pixel_values()` now take `hf_id`
+     and EXPLICITLY skip pixel_values rank-normalization for Qwen-VL
+     models, instead of relying on the rank<3 guard to incidentally no-op.
+     The 2D (num_patches, patch_dim) shape is correct for these models —
+     "normalizing" it would be wrong, not a fallback.
+  3. `_build_trainer()` now receives `hf_id` so it can pick the correct
+     collator and apply Qwen-VL-specific TrainingArguments safety (forces
+     `remove_unused_columns=False`, disables the default collator's column
+     pruning, keeps per_device batch handling sane for ragged patch counts).
+  4. Model-family detection centralized in `_is_qwen_vl()` so it's
+     consistent across all call sites instead of repeated string checks.
+
+  All other behaviour (PhiData + Groq pattern, CLASS_MAP, HF_ID_OVERRIDES,
+  strict-no-fallback loading, early stopping, cosine LR schedule, gradient
+  clipping, failure_reason propagation for ModelSelectionAgent retries) is
+  unchanged. This file is designed to work with whatever model_plan
+  ModelSelectionAgent.select_model() returns — no changes needed on that
+  side.
 """
 
 from phi.agent import Agent
@@ -43,20 +77,24 @@ HF_ID_OVERRIDES: Dict[str, str] = {}
 
 class TrainingAgent:
     """
-    Fine-tunes the selected model on features produced by FeatureEngineeringAgent.
-    Loads encoded HF Dataset from disk, applies LoRA, and trains.
+    Fine-tunes the model selected by ModelSelectionAgent on features
+    produced by FeatureEngineeringAgent. Loads encoded HF Dataset from
+    disk, applies LoRA, and trains.
 
     STRICT MODE: if the requested model fails to load, the agent halts and
-    returns a failed status — it does NOT silently fall back to a lighter model.
+    returns a failed status — it does NOT silently fall back to a lighter
+    model. (Retries happen by calling ModelSelectionAgent.select_model()
+    again with failure_context — see CoordinatorAgent / main.py.)
 
-    New in this version:
-      • Early stopping via EarlyStoppingCallback (patience = plan early_stopping_patience,
-        default 2).  Set to 0 in the plan to disable.
-      • Cosine LR scheduler with linear warmup.
-      • Gradient clipping via max_grad_norm (default 1.0, configurable in plan).
+    Handles two distinct vision-language batching layouts automatically:
+      • Qwen2-VL / Qwen2.5-VL family — pre-patchified pixel_values +
+        image_grid_thw, concatenation-based collation.
+      • Classic vision models (BLIP-2, InstructBLIP, etc.) — (C, H, W)
+        pixel_values, stack-based collation via default_data_collator.
 
-    Return dict always includes `failure_reason` (empty string on success) so
-    the Coordinator can pass it directly to ModelSelectionAgent for a retry.
+    Return dict always includes `failure_reason` (empty string on success)
+    so the Coordinator can pass it directly to ModelSelectionAgent for a
+    retry.
     """
 
     def __init__(self, model_id: str = "mistral"):
@@ -88,7 +126,7 @@ class TrainingAgent:
         Args:
             feature_path : Path returned by FeatureEngineeringAgent (base dir).
                            Contains train/ and val/ subdirectories.
-            model_plan   : Dict from ModelSelectionAgent.
+            model_plan   : Dict from ModelSelectionAgent.select_model().
             device       : 'cuda' | 'cpu' | '' (auto-detect).
 
         Returns:
@@ -128,10 +166,18 @@ class TrainingAgent:
         epochs       = active_plan.get("epochs",                3)
         lr           = active_plan.get("learning_rate",         2e-4)
         precision    = active_plan.get("precision",             "fp16")
-        # ── New configurable training knobs ──────────────────────────────────
+        # ── Configurable training knobs ──────────────────────────────────────
         max_grad_norm    = active_plan.get("max_grad_norm",               1.0)
         es_patience      = active_plan.get("early_stopping_patience",     2)
         lr_scheduler     = active_plan.get("lr_scheduler_type",           "cosine")
+
+        is_qwen_vl = self._is_qwen_vl(hf_id)
+        if is_qwen_vl:
+            logger.info(
+                f"[Training] Detected Qwen-VL family model ({hf_id}) — "
+                f"will use patch-concatenation collator instead of "
+                f"default_data_collator."
+            )
 
         safe_name = name.replace(" ", "_").replace("/", "_")
         out_dir   = CHECKPOINT_DIR / safe_name
@@ -141,7 +187,7 @@ class TrainingAgent:
             model, lora_r, lora_alpha, lora_drop, target_mods, architecture
         )
 
-        train_ds, val_ds = self._prepare_columns(train_ds, val_ds)
+        train_ds, val_ds = self._prepare_columns(train_ds, val_ds, hf_id)
 
         if len(train_ds) == 0:
             return self._fail(
@@ -158,6 +204,7 @@ class TrainingAgent:
                 max_grad_norm=max_grad_norm,
                 es_patience=es_patience,
                 lr_scheduler=lr_scheduler,
+                hf_id=hf_id,
             )
             metrics    = self._run_training(trainer)
             train_loss = round(float(metrics.get("train_loss", 0.0)), 4)
@@ -242,6 +289,19 @@ class TrainingAgent:
         except ImportError:
             pass
         return "cpu"
+
+    def _is_qwen_vl(self, hf_id: str) -> bool:
+        """
+        Centralized model-family detection. Matches both Qwen2-VL and
+        Qwen2.5-VL hf_id naming conventions (e.g.
+        'Qwen/Qwen2.5-VL-3B-Instruct', 'Qwen/Qwen2-VL-7B-Instruct').
+
+        Kept as a single source of truth so column preparation and
+        collator selection never disagree about which model family is
+        active.
+        """
+        h = hf_id.lower()
+        return "qwen" in h and "-vl" in h
 
     # ── Load encoded datasets ─────────────────────────────────────────────────
 
@@ -605,7 +665,7 @@ class TrainingAgent:
 
     # ── Column preparation ────────────────────────────────────────────────────
 
-    def _prepare_columns(self, train_ds, val_ds):
+    def _prepare_columns(self, train_ds, val_ds, hf_id: str = ""):
         drop_tr = [c for c in train_ds.column_names if c not in TENSOR_COLUMNS]
         drop_vl = [c for c in val_ds.column_names   if c not in TENSOR_COLUMNS]
         if drop_tr:
@@ -623,13 +683,30 @@ class TrainingAgent:
                 lambda x: {"labels": x["input_ids"]}, batched=True
             )
 
+        is_qwen_vl = self._is_qwen_vl(hf_id)
+
         if "pixel_values" in train_ds.column_names:
-            try:
-                train_ds, val_ds = self._normalize_pixel_values(
-                    train_ds, val_ds, column="pixel_values"
+            if is_qwen_vl:
+                # Qwen2-VL / Qwen2.5-VL emit pre-patchified pixel_values of
+                # shape (num_patches, patch_dim) — e.g. (256, 1176) — per
+                # example. This is the CORRECT shape, paired with
+                # image_grid_thw. Do NOT run the (C, H, W) rank-3
+                # normalization here; it was written for classic vision
+                # encoders (BLIP-2 / InstructBLIP) and does not apply.
+                logger.info(
+                    "[Training] Skipping pixel_values rank normalization — "
+                    f"{hf_id} is a Qwen-VL family model and uses "
+                    "pre-patchified (num_patches, patch_dim) pixel_values "
+                    "paired with image_grid_thw. This shape is expected, "
+                    "not a bug."
                 )
-            except Exception as e:
-                logger.warning(f"[Training] pixel_values normalization skipped: {e}")
+            else:
+                try:
+                    train_ds, val_ds = self._normalize_pixel_values(
+                        train_ds, val_ds, column="pixel_values"
+                    )
+                except Exception as e:
+                    logger.warning(f"[Training] pixel_values normalization skipped: {e}")
 
         logger.info(f"[Training] Final columns: {train_ds.column_names}")
         return train_ds, val_ds
@@ -638,24 +715,26 @@ class TrainingAgent:
         """
         Ensure `column` is exactly 3D per example: (channels, height, width).
 
-        ROOT CAUSE OF "too many values to unpack (expected 4)":
-        The old logic did a single fixed unwrap (`pv[0]`) based on a single
-        nesting check, which is correct ONLY if the column is exactly one
-        level too deep. If FeatureEngineeringAgent's processor call wrapped
-        the image in an extra list (e.g. producing shape (1, 1, 3, H, W) or
-        even (1, 1, 1, 3, H, W) per row instead of (3, H, W)), a single
-        unwrap pass leaves a residual singleton dimension. The Trainer then
-        collates a batch into a 5D (or higher) tensor instead of the 4D
-        (batch, channels, height, width) InstructBLIP's vision encoder /
-        Q-Former expects internally — and code doing
-        `B, C, H, W = pixel_values.shape` inside the model raises exactly
-        "too many values to unpack (expected 4)".
+        Only ever called for classic (non Qwen-VL) vision-language models —
+        see _prepare_columns(). Qwen-VL's pre-patchified 2D pixel_values
+        must never reach this function, since collapsing it toward rank 3
+        would corrupt the patch layout.
 
-        Fix: instead of a single fixed-depth unwrap, repeatedly strip
-        leading singleton dimensions (via torch tensor rank, not list
-        nesting guesses) until each example is exactly rank-3 (C, H, W).
-        This is robust regardless of how many extra wrapping levels were
-        introduced upstream.
+        ROOT CAUSE OF "too many values to unpack (expected 4)" (the classic-
+        model failure mode this function fixes):
+        A single fixed unwrap (`pv[0]`) is correct ONLY if the column is
+        exactly one level too deep. If the processor wrapped the image in
+        an extra list (e.g. producing shape (1, 1, 3, H, W) or
+        (1, 1, 1, 3, H, W) per row instead of (3, H, W)), a single unwrap
+        pass leaves a residual singleton dimension, and the Trainer
+        collates into a 5D+ tensor instead of the 4D (batch, channels,
+        height, width) the model expects — raising "too many values to
+        unpack (expected 4)" inside `B, C, H, W = pixel_values.shape`.
+
+        Fix: repeatedly strip leading singleton dimensions (via torch
+        tensor rank, not list-nesting guesses) until each example is
+        exactly rank-3 (C, H, W), regardless of how many extra wrapping
+        levels were introduced upstream.
         """
         import torch
 
@@ -664,8 +743,6 @@ class TrainingAgent:
         original_shape = tuple(t.shape)
         logger.info(f"[Training] {column} per-example shape before normalize: {original_shape}")
 
-        # Determine how many leading singleton dims to strip so the
-        # remaining rank is exactly 3 (C, H, W).
         strips_needed = max(0, t.dim() - 3)
 
         if strips_needed == 0 and t.dim() == 3:
@@ -676,7 +753,9 @@ class TrainingAgent:
             logger.warning(
                 f"[Training] {column} has rank {t.dim()} (< 3) — cannot "
                 f"normalize automatically. Leaving as-is; expect a shape "
-                f"error downstream if this is wrong."
+                f"error downstream if this is wrong. (If this is a "
+                f"Qwen-VL model, this function should not have been "
+                f"called at all — check _is_qwen_vl() detection.)"
             )
             return train_ds, val_ds
 
@@ -686,8 +765,6 @@ class TrainingAgent:
                 if isinstance(arr, list) and len(arr) == 1:
                     arr = arr[0]
                 else:
-                    # Shape didn't match expectation (non-singleton or not a
-                    # list) — stop early rather than corrupt the data.
                     break
             return arr
 
@@ -702,7 +779,6 @@ class TrainingAgent:
         train_ds = train_ds.map(normalize_batch, batched=True)
         val_ds   = val_ds.map(normalize_batch,   batched=True)
 
-        # Verify the fix actually worked before declaring success.
         new_sample = train_ds[0][column]
         new_shape  = tuple(torch.as_tensor(new_sample).shape)
         logger.info(
@@ -719,6 +795,80 @@ class TrainingAgent:
 
         return train_ds, val_ds
 
+    # ── Collators ─────────────────────────────────────────────────────────────
+
+    def _qwen_vl_collator(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Batch collator for Qwen2-VL / Qwen2.5-VL.
+
+        Required because default_data_collator's blanket torch.stack()
+        breaks two fields that have non-uniform per-example shapes:
+
+          • pixel_values   — shape (num_patches_i, patch_dim) per example,
+                              where num_patches_i varies with each image's
+                              resolution. Must be torch.cat()'d along dim 0
+                              into a single (total_patches, patch_dim)
+                              tensor — exactly what the Qwen vision tower's
+                              forward() expects to receive, alongside
+                              image_grid_thw, for the whole batch.
+          • image_grid_thw — shape (3,) per example ([t, h, w]). Must be
+                              stacked into (num_images, 3) so the model's
+                              internal `for t, h, w in image_grid_thw: ...`
+                              / unpacking logic gets one full (t, h, w)
+                              triple per image, instead of a flattened or
+                              mis-shaped tensor that yields the wrong
+                              number of values to unpack.
+
+        input_ids / attention_mask / labels are padded+stacked normally
+        (they're already fixed-length after FeatureEngineeringAgent's
+        tokenization step).
+        """
+        import torch
+
+        batch: Dict[str, Any] = {}
+
+        for key in ("input_ids", "attention_mask", "labels"):
+            if key in features[0]:
+                batch[key] = torch.stack(
+                    [torch.as_tensor(f[key]) for f in features]
+                )
+
+        if "pixel_values" in features[0]:
+            batch["pixel_values"] = torch.cat(
+                [torch.as_tensor(f["pixel_values"]) for f in features], dim=0
+            )
+
+        if "image_grid_thw" in features[0]:
+            grids = []
+            for f in features:
+                g = torch.as_tensor(f["image_grid_thw"])
+                # Normalize to (num_images_in_this_example, 3) before
+                # concatenating, so a single-image example with shape (3,)
+                # and a multi-image example with shape (n, 3) both end up
+                # correctly shaped in the final batch tensor.
+                g = g.reshape(-1, 3)
+                grids.append(g)
+            batch["image_grid_thw"] = torch.cat(grids, dim=0)
+
+        # Carry through any other tensor columns generically (stack), in
+        # case FeatureEngineeringAgent adds model-specific extras later.
+        handled = {"input_ids", "attention_mask", "labels",
+                   "pixel_values", "image_grid_thw"}
+        for key in features[0]:
+            if key in handled:
+                continue
+            try:
+                batch[key] = torch.stack(
+                    [torch.as_tensor(f[key]) for f in features]
+                )
+            except Exception as e:
+                logger.debug(
+                    f"[Training] Qwen-VL collator: could not stack extra "
+                    f"column '{key}' ({e}) — dropping from batch."
+                )
+
+        return batch
+
     # ── Trainer ───────────────────────────────────────────────────────────────
 
     def _build_trainer(
@@ -732,12 +882,15 @@ class TrainingAgent:
         max_grad_norm: float = 1.0,
         es_patience:   int   = 2,
         lr_scheduler:  str   = "cosine",
+        hf_id:         str   = "",
     ):
         """
         Build a HuggingFace Trainer with:
           • cosine LR scheduler + linear warmup
           • gradient clipping (max_grad_norm)
           • early stopping (EarlyStoppingCallback, patience=es_patience)
+          • the CORRECT data collator for the model family — this is the
+            fix for the Qwen-VL "not enough values to unpack" crash.
         """
         import torch
         import transformers
@@ -780,13 +933,15 @@ class TrainingAgent:
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             greater_is_better=False,
+            # Must stay False for any vision model: Trainer's automatic
+            # column pruning doesn't understand pixel_values /
+            # image_grid_thw and will strip them before they reach the
+            # collator.
             remove_unused_columns=False,
             report_to="none",
             dataloader_num_workers=0,
-            # ── gradient clipping ─────────────────────────────────────────────
             max_grad_norm=max_grad_norm,
-            # ── LR scheduler ──────────────────────────────────────────────────
-            lr_scheduler_type=lr_scheduler,   # "cosine" by default
+            lr_scheduler_type=lr_scheduler,
         )
 
         # transformers >= 4.46 renamed tokenizer → processing_class
@@ -794,8 +949,20 @@ class TrainingAgent:
         tok_kwarg = "processing_class" if ver >= (4, 46) else "tokenizer"
 
         has_pixels = "pixel_values" in train_ds.column_names
+        is_qwen_vl = self._is_qwen_vl(hf_id)
 
-        # Build callbacks list — add EarlyStoppingCallback only when patience > 0
+        # ── Collator selection ──────────────────────────────────────────────
+        # This is the core fix: Qwen-VL's ragged pixel_values / per-image
+        # image_grid_thw cannot go through default_data_collator's blanket
+        # torch.stack() without corruption (see _qwen_vl_collator docstring).
+        if has_pixels and is_qwen_vl:
+            collator = self._qwen_vl_collator
+            logger.info("[Training] Using Qwen-VL patch-concatenation collator.")
+        elif has_pixels:
+            collator = default_data_collator
+        else:
+            collator = None
+
         callbacks = []
         if es_patience > 0:
             callbacks.append(EarlyStoppingCallback(early_stopping_patience=es_patience))
@@ -809,7 +976,7 @@ class TrainingAgent:
                 args=args,
                 train_dataset=train_ds,
                 eval_dataset=val_ds,
-                data_collator=default_data_collator,
+                data_collator=collator,
                 callbacks=callbacks if callbacks else None,
             )
         else:
@@ -898,26 +1065,16 @@ if __name__ == "__main__":
         print(f"GPU    : {torch.cuda.get_device_name(0)}")
         print(f"VRAM   : {vram:.1f} GB")
 
-    plan = {
-        "hf_id":                      "Salesforce/instructblip-vicuna-7b",
-        "name":                       "InstructBLIP-Vicuna-7B",
-        "architecture":               "causal",
-        "vision":                     True,
-        "loader":                     "InstructBlipForConditionalGeneration",
-        "use_4bit":                   False,
-        "lora_r":                     8,
-        "lora_alpha":                 16,
-        "lora_dropout":               0.05,
-        "target_modules":             ["q_proj", "v_proj"],
-        "batch_size":                 2,
-        "epochs":                     3,
-        "learning_rate":              2e-4,
-        "precision":                  "fp16",
-        # ── new training knobs ───────────────────────────────────────────────
-        "max_grad_norm":              1.0,   # gradient clipping
-        "early_stopping_patience":    2,     # 0 = disabled
-        "lr_scheduler_type":          "cosine",
-    }
+    # This block now mirrors the actual pipeline: ModelSelectionAgent
+    # picks the plan, TrainingAgent consumes it as-is — no manual plan
+    # editing required to make Qwen-VL models work.
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from agents.model_selection_agent import ModelSelectionAgent
+
+    selector = ModelSelectionAgent()
+    plan = selector.select_model(dataset_size=3515, modality="X-Ray")
+    print("\nModel plan from ModelSelectionAgent:")
+    print(json.dumps(plan, indent=2, default=str))
 
     agent = TrainingAgent()
 
@@ -947,11 +1104,7 @@ if __name__ == "__main__":
         # Demo: how to pass failure_reason back to ModelSelectionAgent for retry
         if result.get("status") == "failed":
             print("\n[Demo] Passing failure context to ModelSelectionAgent …")
-            sys.path.insert(0, str(Path(__file__).parent.parent))
-            from agents.model_selection_agent import ModelSelectionAgent
-
-            selector    = ModelSelectionAgent()
-            retry_plan  = selector.select_model(
+            retry_plan = selector.select_model(
                 dataset_size=3515,
                 modality="X-Ray",
                 failure_context={
