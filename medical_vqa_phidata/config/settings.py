@@ -22,7 +22,7 @@ DEFAULT_LORA_ALPHA = 16
 DEFAULT_EPOCHS     = 3
 DEFAULT_BATCH      = 4
 DEFAULT_LR         = 2e-4
-
+MAX_MODEL_RETRIES  = 3
 # ── Evaluation ────────────────────────────────────────────────────────────────
 EVAL_DIR     = os.getenv("EVAL_DIR",    "./artifacts/evaluation")
 EVAL_SAMPLES = int(os.getenv("EVAL_SAMPLES", "200"))
