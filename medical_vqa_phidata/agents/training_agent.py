@@ -362,21 +362,40 @@ class TrainingAgent:
             ],
             "Blip2ForConditionalGeneration": [
                 "Blip2ForConditionalGeneration",
-                "AutoModelForVision2Seq",
+                "AutoModelForImageTextToText",
             ],
             "InstructBlipForConditionalGeneration": [
                 "InstructBlipForConditionalGeneration",
-                "AutoModelForVision2Seq",
+                "AutoModelForImageTextToText",
             ],
+            "Qwen2_5_VLForConditionalGeneration": [
+                "Qwen2_5_VLForConditionalGeneration",
+                "AutoModelForImageTextToText",
+            ],
+            "Qwen2VLForConditionalGeneration": [
+                "Qwen2VLForConditionalGeneration",
+                "AutoModelForImageTextToText",
+            ],
+            # FIX: AutoModelForVision2Seq was removed in modern transformers
+            # (5.x) and replaced by AutoModelForImageTextToText, which is the
+            # universal Auto class covering Qwen2-VL, Qwen2.5-VL, InstructBLIP,
+            # BLIP-2, LLaVA, and most current vision-language models. Keeping
+            # the old name as a key (mapped to the new class) preserves
+            # backward compatibility with any model_plan that still sets
+            # loader="AutoModelForVision2Seq".
             "AutoModelForVision2Seq": [
-                "AutoModelForVision2Seq",
-                "AutoModelForCausalLM",
+                "AutoModelForImageTextToText",
+            ],
+            "AutoModelForImageTextToText": [
+                "AutoModelForImageTextToText",
             ],
             "auto": [
                 "InstructBlipForConditionalGeneration",
                 "Blip2ForConditionalGeneration",
+                "Qwen2_5_VLForConditionalGeneration",
+                "Qwen2VLForConditionalGeneration",
                 "AutoModelForSeq2SeqLM",
-                "AutoModelForVision2Seq",
+                "AutoModelForImageTextToText",   # FIX: was AutoModelForVision2Seq
                 "AutoModelForCausalLM",
             ],
         }
@@ -392,6 +411,10 @@ class TrainingAgent:
                 "transformers.models.instructblip",
             "Blip2ForConditionalGeneration":
                 "transformers.models.blip_2",
+            "Qwen2_5_VLForConditionalGeneration":
+                "transformers.models.qwen2_5_vl",
+            "Qwen2VLForConditionalGeneration":
+                "transformers.models.qwen2_vl",
         }
 
         def _is_real_class(cls) -> bool:
@@ -481,9 +504,18 @@ class TrainingAgent:
             # only kept the LAST error in the chain, which is almost always
             # the least relevant fallback (e.g. AutoModelForCausalLM), and
             # silently buried the real reason the intended class failed.
-            # Surface the hinted class's own error explicitly here.
+            # Surface that class's own error explicitly here.
+            #
+            # NOTE: loader_hint may be an alias (e.g. the deprecated
+            # "AutoModelForVision2Seq") that CLASS_MAP maps to a different
+            # actual class (e.g. "AutoModelForImageTextToText"). Match
+            # against the FIRST entry actually attempted in class_order
+            # (the primary/intended class for this hint) rather than the
+            # raw hint string, so the PRIMARY block is correct even when
+            # an alias was resolved.
+            primary_class_name = class_order[0] if class_order else loader_hint
             primary_error = next(
-                (err for name, err in attempt_errors if name == loader_hint),
+                (err for name, err in attempt_errors if name == primary_class_name),
                 None,
             )
 
@@ -491,12 +523,19 @@ class TrainingAgent:
                 f"  - {name}: {err[:300]}" for name, err in attempt_errors
             ) or "  (no class was actually attempted — all were unavailable)"
 
+            alias_note = (
+                f" (loader_hint '{loader_hint}' resolved to '{primary_class_name}')"
+                if primary_class_name != loader_hint else ""
+            )
+
             primary_block = (
-                f"\nPRIMARY (requested loader '{loader_hint}') error:\n  {primary_error[:500]}\n"
+                f"\nPRIMARY (requested loader '{loader_hint}'{alias_note}) error:\n"
+                f"  {primary_error[:500]}\n"
                 if primary_error else
-                f"\nNote: requested loader '{loader_hint}' was never actually "
-                f"attempted (see skipped classes below) — this is itself "
-                f"likely the real problem.\n"
+                f"\nNote: intended class '{primary_class_name}' for requested "
+                f"loader '{loader_hint}' was never actually attempted (see "
+                f"skipped classes below) — this is itself likely the real "
+                f"problem.\n"
             )
 
             raise RuntimeError(
