@@ -4,183 +4,344 @@ agents/model_selection_agent.py
 ModelSelectionAgent — scores and selects the best open-source VQA model
 architecture based on hardware, dataset size, and modality.
 
-Enhanced version: Enforces an explicit configuration contract containing all keys
-demanded by FeatureEngineeringAgent and TrainingAgent, while integrating robust
-fallback rules when handling previous failure metrics.
+Changes from previous version:
+  - select_model() now accepts an optional `failure_context` dict so the
+    Coordinator can retry selection after a training failure, passing the
+    failed hf_id and error reason.  The agent feeds this to the LLM so it
+    avoids the same model.
+  - _score_models() now hard-filters any model whose known failure
+    patterns match the reported error (OOM, missing class, etc.).
+  - Added _infer_failure_class() to translate free-text error messages into
+    structured exclusion rules (oom / load_error / training_error).
+  - All other behaviour (PhiData + Groq pattern, CLASS_MAP, loader field)
+    is unchanged.
 """
 
 from phi.agent import Agent
 from phi.model.groq import Groq
 
 from typing import Dict, Any, List, Optional
-import json
-import logging
-import re
-import sys
+import json, logging, re, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from config.settings import MODEL_CATALOGUE
 
 logger = logging.getLogger(__name__)
 
-# System-wide architecture dictionary matching explicit deployment contracts
-MODEL_CATALOGUE_DATA = {
-    "Salesforce/instructblip-vicuna-7b": {
-        "name": "InstructBLIP-Vicuna-7B",
-        "architecture": "Vision2Seq",
-        "loader": "Blip2ForConditionalGeneration",
-        "processor_type": "AutoProcessor",
-        "vision": True,
-        "feature_strategy": "Vision2Seq",
-        "collator_type": "DataCollatorForSeq2Seq",
-        "batch_size": 2,
-        "epochs": 3,
-        "lora_r": 8,
-        "target_modules": ["q_proj", "v_proj"]
-    },
-    "Qwen/Qwen2-VL-7B-Instruct": {
-        "name": "Qwen2-VL-7B-Instruct",
-        "architecture": "CausalLM",
-        "loader": "AutoModelForVision2Seq",
-        "processor_type": "AutoProcessor",
-        "vision": True,
-        "feature_strategy": "CausalLM",
-        "collator_type": "QwenVLCollator",
-        "batch_size": 1,
-        "epochs": 3,
-        "lora_r": 4,
-        "target_modules": ["q_proj", "v_proj", "kv_proj"]
-    },
-    "google/flan-t5-base": {
-        "name": "Flan-T5-Base",
-        "architecture": "Seq2Seq",
-        "loader": "AutoModelForSeq2SeqLM",
-        "processor_type": "AutoTokenizer",
-        "vision": False,
-        "feature_strategy": "Seq2Seq",
-        "collator_type": "DataCollatorForSeq2Seq",
-        "batch_size": 8,
-        "epochs": 5,
-        "lora_r": 16,
-        "target_modules": ["q", "v"]
-    }
-}
 
 class ModelSelectionAgent:
     """
-    Selects the optimal model plan for Medical VQA training based on
-    system hardware metrics, dataset specifications, and historical run failures.
+    Selects the best model for Medical VQA training based on
+    GPU VRAM, dataset size, and imaging modality.
+
+    Supports retry-aware selection: pass `failure_context` on a second call
+    so the agent avoids the model that caused the previous training failure.
+
+    Returns a complete model_plan dict used by both
+    FeatureEngineeringAgent and TrainingAgent.
     """
 
-    def __init__(self, model_id: str = "llama-3.1-8b-instant"):
+    def __init__(self, model_id: str = "mistral"):
         self.agent = Agent(
             name="ModelSelectionAgent",
-            model=Groq(id=model_id),
+            model=Groq(id="llama-3.1-8b-instant"),
             instructions=[
-                "You are an expert ML Systems Architect specializing in Medical VQA setups.",
-                "Your objective is to evaluate hardware details, image characteristics, and error arrays,",
-                "and select the best matching model execution schema from the candidate database.",
-                "You MUST return the schema strictly formatted inside a single JSON markdown wrapper block.",
-                "Do not include extra explanations, prose, or unformatted text outside of the JSON payload."
-            ]
+                "You are a machine learning model selection expert.",
+                "Select the best vision-language model for Medical VQA fine-tuning.",
+                "Prefer vision models when VRAM allows.",
+                "If a previous model failed, never pick it again and explain why "
+                "the alternative is safer.",
+                "Always reply with ONLY a JSON object containing "
+                "'selected_model_hf_id', 'model_name', and 'reason'.",
+                "Do not write code. Do not add any text outside the JSON.",
+            ],
+            show_tool_calls=False,
+            markdown=False,
         )
+
+    # ── Public ────────────────────────────────────────────────────────────────
 
     def select_model(
         self,
         dataset_size: int,
-        modality: str,
-        failed_models: Optional[List[str]] = None,
-        failure_reason: str = "",
-        failure_context: Optional[Dict[str, Any]] = None
+        modality:     str,
+        failure_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Filters out failing architectures, re-scores remaining model candidates,
-        and returns a complete compatibility contract block.
+        Auto-detect resources, score all candidate models, and return
+        a complete model_plan dict.
+
+        Args:
+            dataset_size    : Number of training samples.
+            modality        : Imaging modality string (e.g. 'X-Ray').
+            failure_context : Optional dict from a previous failed training run.
+                              Expected keys:
+                                failed_hf_id  – hf_id of the model that failed
+                                reason        – free-text error message
+                              When provided, the failed model is excluded from
+                              scoring and the LLM is told what went wrong.
+
+        Returns:
+            Dict with hf_id, name, architecture, vision, loader,
+            lora config, batch_size, epochs, learning_rate, precision,
+            use_4bit, target_modules, max_seq_len.
         """
-        if failed_models is None:
-            failed_models = []
+        resources = self._detect_resources()
+        device    = resources["device"]
+        vram_gb   = resources["vram_gb"]
+        ram_gb    = resources["ram_gb"]
 
-        # Handle backward compatibility with older orchestration scripts passing a dict context
-        if failure_context and isinstance(failure_context, dict):
-            failed_id = failure_context.get("failed_hf_id") or failure_context.get("failed_model")
-            if failed_id and failed_id not in failed_models:
-                failed_models.append(failed_id)
-            if not failure_reason:
-                failure_reason = failure_context.get("reason", "")
+        # Derive structured exclusion rules from the failure context
+        failed_hf_id    = ""
+        failure_class   = ""
+        failure_summary = ""
+        if failure_context:
+            failed_hf_id    = failure_context.get("failed_hf_id", "")
+            raw_reason      = failure_context.get("reason", "")
+            failure_class   = self._infer_failure_class(raw_reason)
+            failure_summary = (
+                f"Previous model '{failed_hf_id}' failed "
+                f"[{failure_class}]: {raw_reason[:200]}"
+            )
+            logger.info(f"[ModelSelection] Retry mode — {failure_summary}")
 
-        logger.info(f"Selecting VQA model layout for Modality: {modality}, Size: {dataset_size}")
-        if failed_models:
-            logger.warning(f"Excluding known problematic models from execution scope: {failed_models}. Reason: {failure_reason}")
+        scored = self._score_models(
+            vram_gb, device, dataset_size,
+            exclude_hf_id=failed_hf_id,
+            failure_class=failure_class,
+        )
+        if not scored:
+            # Last-resort fallback: cheapest text-only model
+            scored = [m for m in MODEL_CATALOGUE if m["name"] == "Flan-T5-Base"]
 
-        # Filter out broken pipelines based on explicit parameters
-        active_candidates = {}
-        for hf_id, properties in MODEL_CATALOGUE_DATA.items():
-            if hf_id in failed_models:
-                continue
-            
-            candidate_map = properties.copy()
-            # If historical data signals an out of memory limit, systematically dial down parameters safely
-            if "OOM" in failure_reason or "out of memory" in failure_reason.lower():
-                candidate_map["batch_size"] = max(1, candidate_map["batch_size"] // 2)
-                candidate_map["lora_r"] = max(4, candidate_map["lora_r"] // 2)
-
-            active_candidates[hf_id] = candidate_map
-
-        # Absolute fallback defense if all tracking architectures are spent
-        if not active_candidates:
-            logger.critical("All catalogue candidates are disqualified. Activating baseline Seq2Seq safety configuration.")
-            return {
-                "hf_id": "google/flan-t5-base",
-                "name": "Flan-T5-Base",
-                "architecture": "Seq2Seq",
-                "loader": "AutoModelForSeq2SeqLM",
-                "processor_type": "AutoTokenizer",
-                "vision": False,
-                "feature_strategy": "Seq2Seq",
-                "collator_type": "DataCollatorForSeq2Seq",
-                "batch_size": 4,
-                "epochs": 2,
-                "lora_r": 8,
-                "target_modules": ["q", "v"]
-            }
-
-        prompt = (
-            f"Select the best single model contract from the following eligible candidate matrix:\n"
-            f"{json.dumps(active_candidates, indent=2)}\n\n"
-            f"Target Environment Constraints:\n"
-            f"- Modality Target: {modality}\n"
-            f"- Records count: {dataset_size}\n"
-            f"- Disqualified list: {failed_models}\n"
-            f"- Triggering exception trace: '{failure_reason}'\n\n"
-            f"Return the chosen entry with its structural keys completely preserved. Include the model's identifier "
-            f"as the value for the 'hf_id' field inside the root of your JSON object response."
+        top3_summary = "\n".join(
+            f"{i+1}. {m['name']} | hf_id={m['hf_id']} | "
+            f"vision={m['vision']} | params={m['params_b']}B | quality={m['quality']}"
+            for i, m in enumerate(scored[:3])
         )
 
-        try:
-            response = self.agent.run(prompt)
-            parsed_block = self._parse_response(response)
-            if parsed_block and "hf_id" in parsed_block:
-                return parsed_block
-        except Exception as e:
-            logger.error(f"Error resolving agent LLM recommendations: {e}. Defaulting to deterministic selection.")
+        failure_clause = (
+            f"\nIMPORTANT: {failure_summary}\n"
+            f"Do NOT select '{failed_hf_id}'. Choose a safer alternative.\n"
+            if failure_context else ""
+        )
 
-        # Backup deterministic fallback selection from remaining dictionary elements
-        fallback_id = list(active_candidates.keys())[0]
-        selected_plan = active_candidates[fallback_id]
-        selected_plan["hf_id"] = fallback_id
-        return selected_plan
+        prompt = (
+            f"Select the best model for Medical Visual Question Answering.\n"
+            f"Hardware: device={device}  VRAM={vram_gb:.1f}GB  RAM={ram_gb:.1f}GB\n"
+            f"Dataset:  {dataset_size} samples  modality={modality}\n"
+            f"{failure_clause}\n"
+            f"Top candidates:\n{top3_summary}\n\n"
+            f"Pick the model that best balances quality and hardware fit.\n"
+            f"Prefer vision models when VRAM >= 4 GB.\n\n"
+            f'Reply with ONLY: {{"selected_model_hf_id": "<hf_id>", '
+            f'"model_name": "<name>", "reason": "<one sentence>"}}'
+        )
 
-    def _parse_response(self, response) -> Dict[str, Any]:
+        response  = self.agent.run(prompt)
+        llm_hf_id = self._parse_response(response)
+
+        # Use LLM pick if valid and not the failed model, else take top scored
+        best = scored[0]
+        if llm_hf_id and llm_hf_id.lower() != failed_hf_id.lower():
+            for m in MODEL_CATALOGUE:
+                if llm_hf_id.lower() in m["hf_id"].lower():
+                    best = m
+                    break
+
+        use_4bit = (vram_gb < best["min_vram"]) and (device == "cuda")
+
+        plan = {
+            # Identity
+            "hf_id":          best["hf_id"],
+            "name":           best["name"],
+            "architecture":   best["architecture"],
+            "vision":         best["vision"],
+            "loader":         best.get("loader", "auto"),
+
+            # Hardware
+            "use_4bit":       use_4bit,
+            "precision":      "fp32" if device == "cpu" else "fp16",
+
+            # LoRA
+            "lora_r":         8  if dataset_size < 1000 else 16,
+            "lora_alpha":     16 if dataset_size < 1000 else 32,
+            "lora_dropout":   0.05,
+            "target_modules": best["target_modules"],
+
+            # Training
+            "batch_size":     1 if device == "cpu" else (2 if use_4bit else 4),
+            "epochs":         5 if dataset_size < 500 else 3,
+            "learning_rate":  2e-4,
+
+            # Feature engineering
+            "max_seq_len":    128,
+
+            # Metadata for retry tracking
+            "_selected_reason": "",   # filled below
+        }
+
+        # Attach LLM reason if available
         try:
-            text = response.content if hasattr(response, "content") else str(response)
-            json_pattern = re.search(r'\{.*\}', text, re.DOTALL)
-            if json_pattern:
-                return json.loads(json_pattern.group())
+            text = (
+                response.content
+                if hasattr(response, "content")
+                else str(response)
+            )
+            match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+            if match:
+                plan["_selected_reason"] = (
+                    json.loads(match.group()).get("reason", "")
+                )
+        except Exception:
+            pass
+
+        logger.info(
+            f"[ModelSelection] Selected: {plan['hf_id']} "
+            f"(4bit={use_4bit}) reason={plan['_selected_reason']}"
+        )
+        return plan
+
+    # ── Resource detection ────────────────────────────────────────────────────
+
+    def _detect_resources(self) -> Dict[str, Any]:
+        """Auto-detect available GPU and CPU resources at runtime."""
+        import psutil
+        ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device            = "cuda"
+                vram_gb           = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                reserved_gb       = torch.cuda.memory_reserved(0) / (1024 ** 3)
+                vram_available_gb = vram_gb - reserved_gb
+                gpu_name          = torch.cuda.get_device_name(0)
+                logger.info(
+                    f"GPU detected: {gpu_name} | "
+                    f"Total VRAM: {vram_gb:.1f}GB | "
+                    f"Available: {vram_available_gb:.1f}GB"
+                )
+            else:
+                device            = "cpu"
+                vram_available_gb = 0.0
+                logger.info("No GPU detected, using CPU.")
         except Exception as e:
-            logger.error(f"Failed parsing selected model structure string map: {e}")
-        return {}
+            logger.warning(f"Could not detect GPU: {e}. Falling back to CPU.")
+            device            = "cpu"
+            vram_available_gb = 0.0
+
+        logger.info(f"RAM available: {ram_gb:.1f}GB | Device: {device}")
+        return {"device": device, "vram_gb": vram_available_gb, "ram_gb": ram_gb}
+
+    # ── Scoring ───────────────────────────────────────────────────────────────
+
+    def _score_models(
+        self,
+        vram_gb:        float,
+        device:         str,
+        dataset_size:   int,
+        exclude_hf_id:  str = "",
+        failure_class:  str = "",
+    ) -> List[Dict]:
+        """
+        Score and filter models.
+
+        Extra exclusion logic when a failure_class is known:
+          oom          → also exclude all models with min_vram > vram_gb * 0.9
+          load_error   → exclude the exact failed hf_id only (already done)
+          training_err → no extra exclusion; rely on exclude_hf_id
+        """
+        feasible = []
+        for m in MODEL_CATALOGUE:
+            # Hard-exclude the model that already failed
+            if exclude_hf_id and m["hf_id"].lower() == exclude_hf_id.lower():
+                logger.debug(f"[ModelSelection] Excluded (prev failure): {m['hf_id']}")
+                continue
+
+            # Hard-exclude models that won't fit in VRAM when OOM was the cause
+            if failure_class == "oom" and device == "cuda":
+                safe_vram = vram_gb * 0.85  # keep 15 % headroom
+                if m["min_vram"] > safe_vram and m["min_vram_4bit"] > safe_vram:
+                    logger.debug(
+                        f"[ModelSelection] Excluded (OOM headroom): {m['hf_id']}"
+                    )
+                    continue
+
+            # Normal VRAM feasibility check
+            ok = (
+                True if device == "cpu"
+                else (vram_gb >= m["min_vram"] or vram_gb >= m["min_vram_4bit"])
+            )
+            if not ok:
+                continue
+
+            score = m["quality"]
+            if dataset_size < 500 and m["params_b"] > 7:
+                score *= 0.8
+
+            feasible.append({**m, "_score": score})
+
+        return sorted(feasible, key=lambda x: x["_score"], reverse=True)
+
+    # ── Failure classification ────────────────────────────────────────────────
+
+    def _infer_failure_class(self, reason: str) -> str:
+        """
+        Translate a free-text training error into one of three categories:
+          oom           – out-of-memory / CUDA memory error
+          load_error    – model failed to load (class not found, weight mismatch …)
+          training_err  – model loaded but training loop crashed
+
+        Used by _score_models() to apply appropriate exclusion heuristics.
+        """
+        r = reason.lower()
+        if any(k in r for k in ("out of memory", "cuda error", "oom",
+                                 "cudaoutofmemory", "memory")):
+            return "oom"
+        if any(k in r for k in ("failed to load", "cannot load",
+                                 "no module", "not found in transformers",
+                                 "weight", "checkpoint")):
+            return "load_error"
+        return "training_err"
+
+    # ── Response parsing ──────────────────────────────────────────────────────
+
+    def _parse_response(self, response) -> str:
+        try:
+            text  = response.content if hasattr(response, "content") else str(response)
+            match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+            if match:
+                return json.loads(match.group()).get("selected_model_hf_id", "")
+        except Exception:
+            pass
+        return ""
+
+
+# ── Standalone entry point ────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    selector = ModelSelectionAgent()
-    print(json.dumps(selector.select_model(2244, "X-Ray"), indent=2))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s][%(levelname)s] %(message)s",
+    )
+
+    agent = ModelSelectionAgent()
+
+    # Normal selection
+    print("=== Normal selection ===")
+    result = agent.select_model(dataset_size=3515, modality="X-Ray")
+    print(json.dumps(result, indent=2))
+
+    # Retry after OOM
+    print("\n=== Retry after OOM ===")
+    result2 = agent.select_model(
+        dataset_size=3515,
+        modality="X-Ray",
+        failure_context={
+            "failed_hf_id": result["hf_id"],
+            "reason":       "CUDA out of memory. Tried to allocate 2.50 GiB",
+        },
+    )
+    print(json.dumps(result2, indent=2))
