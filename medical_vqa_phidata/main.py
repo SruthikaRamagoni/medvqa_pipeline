@@ -211,11 +211,75 @@ def run_pipeline(args) -> PipelineState:
             model_plan=model_plan,
             device=state.device,
         )
+       
         if training_result.get("status") == "failed":
-            state.errors.append(training_result.get("message", "Training failed"))
-            logger.error(f"Training failed: {training_result['message']}")
-            state.save()
-            return state
+    
+            state.retry_count += 1
+            state.failure_reason = training_result.get("failure_reason", "")
+            state.previous_models.append(
+                training_result.get("model_used", "")
+            )
+        
+            while state.retry_count <= MAX_MODEL_RETRIES:
+        
+                logger.warning(
+                    f"Retry {state.retry_count}/{MAX_MODEL_RETRIES}"
+                )
+        
+                retry_plan = model_sel_agent.select_model(
+                    dataset_size=collection_result["records_count"],
+                    modality=state.modality,
+                    failure_context={
+                        "failed_hf_id": training_result.get("model_used", ""),
+                        "reason": training_result.get("failure_reason", ""),
+                    },
+                )
+        
+                fe_result = fe_agent.engineer_features(
+                    processed_data_path=state.processed_data_path,
+                    model_plan=retry_plan,
+                    device=state.device,
+                )
+        
+                if fe_result.get("status") == "failed":
+                    state.errors.append(
+                        fe_result.get("message", "")
+                    )
+                    break
+        
+                training_result = training_agent.train(
+                    feature_path=fe_result["feature_path"],
+                    model_plan=retry_plan,
+                    device=state.device,
+                )
+        
+                if training_result.get("status") != "failed":
+        
+                    state.model_hf_id = retry_plan["hf_id"]
+                    state.model_name = retry_plan["name"]
+                    state.model_architecture = retry_plan["architecture"]
+                    state.model_vision = retry_plan["vision"]
+        
+                    state.checkpoint_path = (
+                        training_result["checkpoint_path"]
+                    )
+        
+                    break
+        
+                state.retry_count += 1
+                state.previous_models.append(
+                    training_result.get("model_used", "")
+                )
+        
+            if training_result.get("status") == "failed":
+                state.errors.append(
+                    training_result.get("failure_reason", "")
+                )
+                state.save()
+                return state
+
+
+      
         state.checkpoint_path = training_result["checkpoint_path"]
         state.log(
             f"Training done. Loss={training_result.get('train_loss','N/A')}  "
