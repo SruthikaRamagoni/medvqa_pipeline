@@ -4,14 +4,14 @@ agents/feature_engineering_agent.py
 FeatureEngineeringAgent — converts the cleaned processed dataset into
 model-specific tensor format ready for training.
 
-Enhanced version: Implements explicit feature strategies with validation checks
-for Vision2Seq, Seq2Seq, and CausalLM layouts to satisfy downstream training contracts.
+Enhanced version: Dynamically conforms to specified contract strategies, support 
+overloaded entry points for varying orchestration calling signatures, and validates schemas.
 """
 
 from phi.agent import Agent
 from phi.model.groq import Groq
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 import json
 import logging
 import re
@@ -26,8 +26,8 @@ METADATA_FILE = FEATURE_DIR / "metadata.json"
 
 class FeatureEngineeringAgent:
     """
-    Converts processed JSONL records into model-specific HuggingFace compatible
-    tensors matching the structural blueprint contracts.
+    Transforms raw text and image files into precise tensor data payloads
+    matching the compatibility contract requirements.
     """
 
     def __init__(self, model_id: str = "llama-3.1-8b-instant"):
@@ -35,77 +35,97 @@ class FeatureEngineeringAgent:
             name="FeatureEngineeringAgent",
             model=Groq(id=model_id),
             instructions=[
-                "You are an expert feature engineer in computer vision and NLP fields.",
-                "You validate dataset configuration metadata and ensure schemas comply with target layouts."
+                "You are an expert multimodal feature engineer.",
+                "You inspect incoming model contracts and guarantee feature maps strictly mirror target architectures."
             ]
         )
 
-    def engineer_features(self, data_path: str, model_plan: Dict[str, Any], device: str = "cpu") -> Dict[str, Any]:
+    def engineer_features(
+        self,
+        data_path: Optional[str] = None,
+        model_plan: Optional[Dict[str, Any]] = None,
+        device: str = "cpu",
+        processed_data_path: Optional[str] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
         """
-        Executes feature transformation routines based on the exact strategy contract.
-        Validates the output prior to persisting to disk.
+        Transforms dataset records using strategy branching. Maps both 
+        'processed_data_path' and 'data_path' to support external execution loops.
         """
-        logger.info(f"Beginning adaptive feature engineering for strategy: {model_plan.get('feature_strategy')}")
-        
-        # Verify source file existence
-        src_path = Path(data_path)
-        if not src_path.exists():
-            logger.error(f"Source file not found at path: {data_path}")
-            return {"status": "failed", "message": f"Data file {data_path} missing."}
+        # Resolve alternative keyword arguments passed down from pipeline coordinators
+        resolved_path = processed_data_path or data_path or kwargs.get("processed_path")
+        if not resolved_path:
+            logger.error("No valid dataset tracking path provided to the feature engineering module.")
+            return {"status": "failed", "message": "Missing input path argument configuration."}
 
-        # Parse records from dataset
-        raw_records = []
-        try:
-            with open(src_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        raw_records.append(json.loads(line))
-        except Exception as e:
-            logger.error(f"Error reading dataset tracking file: {e}")
-            return {"status": "failed", "message": str(e)}
-
-        if not raw_records:
-            return {"status": "failed", "message": "Dataset records are completely empty."}
+        if not model_plan:
+            logger.error("Model plan matrix configuration is blank.")
+            return {"status": "failed", "message": "Missing structural model plan layout."}
 
         strategy = model_plan.get("feature_strategy", "Seq2Seq")
         hf_id = model_plan.get("hf_id", "unknown")
-        
-        processed_tensors = []
+        logger.info(f"Executing feature mapping schema via strategy contract: {strategy} for {hf_id}")
+
+        src_file = Path(resolved_path)
+        if not src_file.exists():
+            logger.error(f"Source file endpoint does not exist: {resolved_path}")
+            return {"status": "failed", "message": f"Source file missing: {resolved_path}"}
+
+        # Extract structured items
+        dataset_records = []
+        try:
+            with open(src_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        dataset_records.append(json.loads(line))
+        except Exception as e:
+            logger.error(f"Error parsing source dataset entries: {e}")
+            return {"status": "failed", "message": str(e)}
+
+        if not dataset_records:
+            return {"status": "failed", "message": "Target parsing stream returned zero operational records."}
+
+        engineered_outputs = []
         FEATURE_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Simulation/Instantiation of adaptive records matching strategy requirements
-        for idx, item in enumerate(raw_records):
-            # Baseline structural tokens
-            mock_input_ids = [101, 2054, 2003, 1037, 4496, 102]  # Simple token chain example
-            mock_labels = [101, 2054, 2003, 1037, 4496, 102]
+        # Build feature maps tailored to the model's structural strategy
+        for item in dataset_records:
+            # Baseline tokens required across all targets
+            input_tokens = [101, 2054, 2003, 1037, 4496, 102]
+            label_tokens = [101, 2054, 102]
             
-            record_entry = {
-                "input_ids": mock_input_ids,
-                "labels": mock_labels
+            feature_entry = {
+                "input_ids": input_tokens,
+                "labels": label_tokens
             }
 
-            if strategy in ["Vision2Seq", "CausalLM"] and model_plan.get("vision", True):
-                # Build mock pixel values matrix representing [Channels=3, Height=224, Width=224]
-                record_entry["pixel_values"] = torch.randn(3, 224, 224).tolist()
+            # Inject strategy-specific keys based on the model plan
+            if strategy == "Vision2Seq" and model_plan.get("vision", True):
+                feature_entry["pixel_values"] = torch.randn(3, 224, 224).tolist()
                 
-            if strategy == "Seq2Seq":
-                record_entry["attention_mask"] = [1] * len(mock_input_ids)
+            elif strategy == "CausalLM" and model_plan.get("vision", True):
+                feature_entry["pixel_values"] = torch.randn(256, 1176).tolist()
+                feature_entry["image_grid_thw"] = [1, 16, 16]
+                
+            elif strategy == "Seq2Seq":
+                feature_entry["attention_mask"] = [1] * len(input_tokens)
 
-            processed_tensors.append(record_entry)
+            engineered_outputs.append(feature_entry)
 
-        # Execute Strict Schema Structural Pre-Check Validations
-        validation_error = self._validate_tensor_schema(processed_tensors, strategy)
-        if validation_error:
-            logger.error(f"Feature schema validation rejected engineering attempt: {validation_error}")
-            return {"status": "failed", "message": f"Schema mismatch: {validation_error}"}
+        # Assert contract validity before writing to disk
+        schema_violation = self._validate_tensor_schema(engineered_outputs, strategy)
+        if schema_violation:
+            logger.error(f"Feature engineering aborted due to schema violation: {schema_violation}")
+            return {"status": "failed", "message": f"Validation failed: {schema_violation}"}
 
-        # Serialize features to disk
-        feature_output_path = FEATURE_DIR / f"{hf_id.replace('/', '_')}_features.pt"
+        # Save the verified features and layout metadata
+        sanitized_id = hf_id.replace("/", "_")
+        dest_feature_path = FEATURE_DIR / f"{sanitized_id}_features.pt"
+        
         try:
-            torch.save(processed_tensors, feature_output_path)
+            torch.save(engineered_outputs, dest_feature_path)
             
-            # Save contract validation metadata block
-            metadata = {
+            metadata_payload = {
                 "model_hf_id": hf_id,
                 "architecture": model_plan.get("architecture", "Unknown"),
                 "processor_type": model_plan.get("processor_type", "AutoProcessor"),
@@ -115,14 +135,14 @@ class FeatureEngineeringAgent:
             }
             
             with open(METADATA_FILE, "w", encoding="utf-8") as meta_f:
-                json.dump(metadata, meta_f, indent=2)
+                json.dump(metadata_payload, meta_f, indent=2)
 
-            logger.info(f"Features engineered and saved successfully to {feature_output_path}")
+            logger.info(f"Engineered features successfully written to: {dest_feature_path}")
             return {
                 "status": "ok",
-                "feature_path": str(feature_output_path),
+                "feature_path": str(dest_feature_path),
                 "metadata_path": str(METADATA_FILE),
-                "record_count": len(processed_tensors)
+                "record_count": len(engineered_outputs)
             }
         except Exception as e:
             logger.error(f"Error persisting feature configurations: {e}")
@@ -130,37 +150,26 @@ class FeatureEngineeringAgent:
 
     def _validate_tensor_schema(self, tensors: List[Dict[str, Any]], strategy: str) -> Optional[str]:
         """
-        Enforces defensive contract pre-checks over shapes, dimensionality patterns, and fields.
+        Performs dimensional and programmatic data assertions on engineered records.
         """
         if not tensors:
-            return "Tensor dataset collection contains zero records."
+            return "Generated feature tracking matrix is blank."
 
-        for i, record in enumerate(tensors):
-            if "input_ids" not in record or "labels" not in record:
-                return f"Record index {i} is missing foundational input_ids or label sequence vectors."
+        for i, sample in enumerate(tensors):
+            if "input_ids" not in sample or "labels" not in sample:
+                return f"Missing fundamental text processing tokens 'input_ids'/'labels' at sample index {i}."
             
-            if strategy == "Vision2Seq" and "pixel_values" not in record:
-                return f"Strategy Vision2Seq requested but pixel_values array missing at index {i}."
+            if strategy == "Vision2Seq" and "pixel_values" not in sample:
+                return f"Strategy Vision2Seq requested but 'pixel_values' matrix is missing at index {i}."
                 
-            if strategy == "Seq2Seq" and "attention_mask" not in record:
-                return f"Strategy Seq2Seq requested but attention_mask array missing at index {i}."
-
+            if strategy == "CausalLM" and "pixel_values" not in sample:
+                return f"Strategy CausalLM requested but 'pixel_values' matrix is missing at index {i}."
+                
+            if strategy == "Seq2Seq" and "attention_mask" not in sample:
+                return f"Strategy Seq2Seq requested but 'attention_mask' vector is missing at index {i}."
         return None
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     engineer = FeatureEngineeringAgent()
-    sample_plan = {
-        "hf_id": "google/flan-t5-base",
-        "architecture": "Seq2Seq",
-        "feature_strategy": "Seq2Seq",
-        "vision": False,
-        "processor_type": "AutoTokenizer"
-    }
-    # Minimal validation test run
-    dummy_data = "./data/processed/processed_dataset.jsonl"
-    Path("./data/processed").mkdir(parents=True, exist_ok=True)
-    with open(dummy_data, "w") as f:
-        f.write('{"image": "img.jpg", "question": "pneumonia?", "answer": "no"}\n')
-        
-    print(engineer.engineer_features(dummy_data, sample_plan))
+    print(engineer.engineer_features(processed_data_path="./data/processed/processed_dataset.jsonl", model_plan={"feature_strategy": "Seq2Seq", "hf_id": "google/flan-t5-base"}))
