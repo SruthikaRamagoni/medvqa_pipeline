@@ -8,8 +8,8 @@ Changes from previous version (fixes the
 "not enough values to unpack (expected 3, got 1)" crash on Qwen2-VL /
 Qwen2.5-VL training):
 
-  ROOT CAUSE
-  ----------
+  ROOT CAUSE #1 (fixed previously) — wrong batch collation strategy
+  ------------------------------------------------------------------
   Qwen2-VL / Qwen2.5-VL processors emit `pixel_values` already patchified,
   per example, as a 2D tensor of shape (num_patches, patch_dim) — e.g.
   (256, 1176) — NOT the classic (C, H, W) layout that BLIP-2 / InstructBLIP
@@ -17,32 +17,61 @@ Qwen2.5-VL training):
   the vision tower how to reshape the flat patch sequence back into a
   spatial (t, h, w) grid.
 
-  The previous version always used `default_data_collator` whenever
-  `pixel_values` was present. That collator blindly `torch.stack()`s every
-  column. For Qwen-VL models this is wrong on both fields:
-    - `pixel_values` must be CONCATENATED across the batch (patch counts
-      differ per image), not stacked.
-    - `image_grid_thw` must be stacked into shape (num_images, 3).
-  Naive stacking mangles `image_grid_thw` so the vision tower's internal
-  `t, h, w = grid_thw` unpack receives the wrong number of values —
-  producing exactly "not enough values to unpack (expected 3, got 1)".
+  `default_data_collator` blindly `torch.stack()`s every column, which is
+  wrong for both these fields: `pixel_values` has a different patch count
+  per example (different image resolutions) so it must be CONCATENATED,
+  not stacked; `image_grid_thw` must be stacked/concatenated into shape
+  (num_images, 3). This was fixed with a dedicated `_qwen_vl_collator()`.
+
+  ROOT CAUSE #2 (fixed in this version) — stray leading batch dim
+  ------------------------------------------------------------------
+  After fixing pixel_values/image_grid_thw collation, a second, distinct
+  bug surfaced: "The shape of the mask [1, 128] at index 0 does not match
+  the shape of the indexed tensor [4, 1] at index 0".
+
+  Qwen2.5-VL's `get_rope_index()` requires `input_ids` and
+  `attention_mask` to be exactly 2D: (batch_size, sequence_length). If
+  FeatureEngineeringAgent calls the HF processor per-example with
+  `return_tensors="pt"` (its natural mode) and saves the result to the HF
+  Dataset WITHOUT first calling `.squeeze(0)`, each example's `input_ids`
+  / `attention_mask` / `labels` is stored with a stray leading dim of 1:
+  shape (1, seq_len) instead of (seq_len,). `torch.stack()`-ing 4 such
+  examples then produces a 3D tensor (4, 1, seq_len) instead of the
+  required 2D (4, seq_len) — and `get_rope_index`'s internal per-batch-item
+  masking logic, written for strictly 2D input, throws a mask/tensor shape
+  mismatch when it receives this 3D tensor.
+
+  This was confirmed by direct reproduction: stacking four (1, 128)
+  per-example tensors produces (4, 1, 128); squeezing the stray leading
+  dim of 1 before stacking (only when present — see below) produces the
+  correct (4, 128) that matches Qwen2.5-VL's documented contract.
 
   FIX
   ---
-  1. New `_qwen_vl_collator()` — concatenates `pixel_values`, stacks
-     `image_grid_thw` correctly, stacks the rest normally. Used instead of
-     `default_data_collator` whenever the model family is Qwen-VL.
-  2. `_prepare_columns()` / `_normalize_pixel_values()` now take `hf_id`
-     and EXPLICITLY skip pixel_values rank-normalization for Qwen-VL
-     models, instead of relying on the rank<3 guard to incidentally no-op.
-     The 2D (num_patches, patch_dim) shape is correct for these models —
-     "normalizing" it would be wrong, not a fallback.
-  3. `_build_trainer()` now receives `hf_id` so it can pick the correct
-     collator and apply Qwen-VL-specific TrainingArguments safety (forces
-     `remove_unused_columns=False`, disables the default collator's column
-     pruning, keeps per_device batch handling sane for ragged patch counts).
-  4. Model-family detection centralized in `_is_qwen_vl()` so it's
+  1. `_qwen_vl_collator()` now squeezes a stray leading dim of 1 off
+     `input_ids` / `attention_mask` / `labels` (only if present — a
+     dataset that already stores (seq_len,) per example is left
+     untouched, so this is non-destructive either way) BEFORE stacking,
+     guaranteeing the batch is 2D (batch_size, seq_len) as required.
+  2. `image_grid_thw` is reshaped to (-1, 3) per example before
+     concatenating, so it's robust whether stored as (3,) or (1, 3) per
+     example.
+  3. `pixel_values` is concatenated (not stacked) across the batch, since
+     patch counts vary by image resolution.
+  4. `_prepare_columns()` / `_normalize_pixel_values()` take `hf_id` and
+     EXPLICITLY skip the (C, H, W) rank-3 pixel_values normalization for
+     Qwen-VL models — that normalization was written for classic vision
+     encoders (BLIP-2 / InstructBLIP) and does not apply here; the 2D
+     (num_patches, patch_dim) shape is correct as-is.
+  5. `_build_trainer()` receives `hf_id` so it can select the correct
+     collator and forces `remove_unused_columns=False` (required for any
+     vision model — Trainer's automatic column pruning doesn't understand
+     pixel_values / image_grid_thw).
+  6. Model-family detection centralized in `_is_qwen_vl()` so it's
      consistent across all call sites instead of repeated string checks.
+
+  All fixes verified by direct reproduction against realistic per-example
+  tensor shapes (see accompanying test script) before being included here.
 
   All other behaviour (PhiData + Groq pattern, CLASS_MAP, HF_ID_OVERRIDES,
   strict-no-fallback loading, early stopping, cosine LR schedule, gradient
@@ -801,37 +830,63 @@ class TrainingAgent:
         """
         Batch collator for Qwen2-VL / Qwen2.5-VL.
 
-        Required because default_data_collator's blanket torch.stack()
-        breaks two fields that have non-uniform per-example shapes:
+        Handles two distinct shape problems that default_data_collator's
+        blanket torch.stack() gets wrong for this model family:
 
+        1. pixel_values / image_grid_thw — ragged per-example shapes
+           ---------------------------------------------------------
           • pixel_values   — shape (num_patches_i, patch_dim) per example,
                               where num_patches_i varies with each image's
                               resolution. Must be torch.cat()'d along dim 0
                               into a single (total_patches, patch_dim)
                               tensor — exactly what the Qwen vision tower's
-                              forward() expects to receive, alongside
-                              image_grid_thw, for the whole batch.
-          • image_grid_thw — shape (3,) per example ([t, h, w]). Must be
-                              stacked into (num_images, 3) so the model's
-                              internal `for t, h, w in image_grid_thw: ...`
-                              / unpacking logic gets one full (t, h, w)
-                              triple per image, instead of a flattened or
-                              mis-shaped tensor that yields the wrong
-                              number of values to unpack.
+                              forward() expects, alongside image_grid_thw,
+                              for the whole batch.
+          • image_grid_thw — logically (3,) per image ([t, h, w]), but may
+                              be stored as (3,) or (1, 3) depending on how
+                              FeatureEngineeringAgent saved it. Reshaped to
+                              (-1, 3) per example, then concatenated into
+                              (num_images, 3) so the model receives one
+                              full (t, h, w) triple per image.
 
-        input_ids / attention_mask / labels are padded+stacked normally
-        (they're already fixed-length after FeatureEngineeringAgent's
-        tokenization step).
+        2. input_ids / attention_mask / labels — stray leading batch dim
+           ---------------------------------------------------------------
+          HF processors return (1, seq_len) per call (they always assume
+          a batch). If FeatureEngineeringAgent saved that shape directly
+          to the HF Dataset without squeezing the leading dim, each
+          example is stored as (1, seq_len) instead of (seq_len,).
+          torch.stack()-ing N such examples then produces a 3D tensor
+          (N, 1, seq_len) instead of the 2D (N, seq_len) that
+          get_rope_index() requires — causing a mask/tensor shape
+          mismatch deep inside the model's forward pass (e.g. "The shape
+          of the mask [1, 128] at index 0 does not match the shape of the
+          indexed tensor [4, 1] at index 0").
+
+          Fix: squeeze a leading dim of size 1 off each example BEFORE
+          stacking, but ONLY when it's actually present — a dataset that
+          already stores plain (seq_len,) per example passes through
+          unchanged, so this is safe regardless of how
+          FeatureEngineeringAgent encoded the data.
         """
         import torch
+
+        def _squeeze_stray_leading_dim(t: "torch.Tensor") -> "torch.Tensor":
+            # Only squeeze a genuine (1, seq_len) -> (seq_len,) case.
+            # Do NOT touch anything else, so already-correct 1D examples
+            # and any other shape are left exactly as they are.
+            if t.dim() == 2 and t.shape[0] == 1:
+                return t.squeeze(0)
+            return t
 
         batch: Dict[str, Any] = {}
 
         for key in ("input_ids", "attention_mask", "labels"):
             if key in features[0]:
-                batch[key] = torch.stack(
-                    [torch.as_tensor(f[key]) for f in features]
-                )
+                tensors = [
+                    _squeeze_stray_leading_dim(torch.as_tensor(f[key]))
+                    for f in features
+                ]
+                batch[key] = torch.stack(tensors)
 
         if "pixel_values" in features[0]:
             batch["pixel_values"] = torch.cat(
@@ -843,9 +898,9 @@ class TrainingAgent:
             for f in features:
                 g = torch.as_tensor(f["image_grid_thw"])
                 # Normalize to (num_images_in_this_example, 3) before
-                # concatenating, so a single-image example with shape (3,)
-                # and a multi-image example with shape (n, 3) both end up
-                # correctly shaped in the final batch tensor.
+                # concatenating, so a single-image example stored as (3,)
+                # OR (1, 3), and a multi-image example stored as (n, 3),
+                # all end up correctly shaped in the final batch tensor.
                 g = g.reshape(-1, 3)
                 grids.append(g)
             batch["image_grid_thw"] = torch.cat(grids, dim=0)
@@ -990,11 +1045,37 @@ class TrainingAgent:
             )
 
     def _run_training(self, trainer) -> Dict:
+        self._log_first_batch_shapes(trainer)
         logger.info("[Training] Starting training loop …")
         result  = trainer.train()
         metrics = getattr(result, "metrics", {})
         logger.info(f"[Training] Metrics: {metrics}")
         return metrics
+
+    def _log_first_batch_shapes(self, trainer) -> None:
+        """
+        Pull exactly one collated batch through the Trainer's own
+        dataloader and log every tensor's shape before training starts.
+
+        This turns any future collation/shape bug into a one-line log
+        diagnosis instead of a cryptic mid-forward-pass crash that
+        requires another full training attempt to even see the input
+        shapes that caused it.
+        """
+        try:
+            import torch
+            loader = trainer.get_train_dataloader()
+            batch = next(iter(loader))
+            shapes = {
+                k: (tuple(v.shape) if isinstance(v, torch.Tensor) else type(v).__name__)
+                for k, v in batch.items()
+            }
+            logger.info(f"[Training] First collated batch shapes: {shapes}")
+        except Exception as e:
+            logger.warning(
+                f"[Training] Could not pre-inspect first batch shapes "
+                f"(non-fatal, continuing): {e}"
+            )
 
     # ── Save ──────────────────────────────────────────────────────────────────
 
