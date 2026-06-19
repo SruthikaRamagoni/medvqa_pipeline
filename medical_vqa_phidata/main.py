@@ -23,7 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
 sys.path.insert(0, str(ROOT))
-
+from config.settings import MAX_MODEL_RETRIES
 from core.state import PipelineState
 from agents.modality_discovery_agent  import ModalityDiscoveryAgent
 from agents.data_discovery_agent      import DataDiscoveryAgent
