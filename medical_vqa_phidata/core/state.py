@@ -40,7 +40,10 @@ class PipelineState:
     epochs:             int   = 3
     learning_rate:      float = 2e-4
     precision:          str   = "fp16"
-
+    # Retry tracking
+    retry_count:        int = 0
+    previous_models:    List[str] = field(default_factory=list)
+    failure_reason:     str = ""
     # ── Hardware ──────────────────────────────────────────────────────────────
     device:   str   = "cpu"
     vram_gb:  float = 0.0
