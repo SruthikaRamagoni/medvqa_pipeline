@@ -313,6 +313,23 @@ class TrainingAgent:
         import torch
         import transformers as tf
 
+        # ── Sanity check: PyTorch backend actually usable ──────────────────────
+        # transformers' lazy-loading masks a missing/broken torch backend as a
+        # generic "Unrecognized configuration class ... for AutoModelForX"
+        # error from whichever fallback class happened to be a real class.
+        # Catch it here with an explicit, actionable message instead.
+        try:
+            _ = torch.tensor([0.0])
+        except Exception as e:
+            raise RuntimeError(
+                "PyTorch backend is not usable in this environment "
+                f"(torch.tensor() failed: {e}). transformers' lazy-loader "
+                "will silently substitute Placeholder objects for "
+                "vision-language model classes when this happens, producing "
+                "misleading 'Unrecognized configuration class' errors. "
+                "Fix the PyTorch install before retrying."
+            )
+
         dtype = (
             torch.float16
             if precision == "fp16" and device == "cuda"
@@ -365,26 +382,130 @@ class TrainingAgent:
         }
         class_order = CLASS_MAP.get(loader_hint, CLASS_MAP["auto"])
 
-        model      = None
-        last_error = None
-        for cls_name in class_order:
-            cls = getattr(tf, cls_name, None)
+        # Explicit submodule fallback paths for classes that are sometimes NOT
+        # exported at the top-level `transformers` namespace depending on
+        # version (this was the root cause of the InstructBLIP failure: the
+        # top-level getattr silently returned None and the loop fell through
+        # to AutoModelForCausalLM, which can't parse InstructBlipConfig at all).
+        SUBMODULE_FALLBACKS: Dict[str, str] = {
+            "InstructBlipForConditionalGeneration":
+                "transformers.models.instructblip",
+            "Blip2ForConditionalGeneration":
+                "transformers.models.blip_2",
+        }
+
+        def _is_real_class(cls) -> bool:
+            """
+            transformers' lazy-loading system (esp. v5.x) can return a
+            'Placeholder' stand-in object for classes whose backend
+            (e.g. PyTorch) failed to import or isn't installed in this
+            environment — getattr() does NOT return None in that case,
+            it returns the Placeholder, which only raises when actually
+            called. This check catches that before we waste a load attempt.
+            """
             if cls is None:
+                return False
+            return "Placeholder" not in type(cls).__name__ and \
+                   "Placeholder" not in getattr(cls, "__name__", "")
+
+        def _resolve_class(cls_name: str):
+            """
+            Resolve a model class by name.
+            1. Try top-level transformers namespace (normal case).
+            2. If missing or a lazy-load Placeholder, try the documented
+               submodule path.
+            Returns (cls_or_None, resolution_note) — note explains *why*
+            it was unavailable when both attempts fail, instead of a bare
+            'skipping' with no diagnostic value.
+            """
+            cls = getattr(tf, cls_name, None)
+            if _is_real_class(cls):
+                return cls, "top-level"
+            if cls is not None:
                 logger.debug(
-                    f"[Training] Class {cls_name} not in transformers — skipping."
+                    f"[Training] {cls_name} resolved to a lazy-load "
+                    f"Placeholder (backend e.g. torch likely missing/broken) "
+                    f"— trying submodule fallback."
+                )
+
+            submodule_path = SUBMODULE_FALLBACKS.get(cls_name)
+            if submodule_path:
+                try:
+                    import importlib
+                    mod = importlib.import_module(submodule_path)
+                    sub_cls = getattr(mod, cls_name, None)
+                    if _is_real_class(sub_cls):
+                        return sub_cls, f"submodule:{submodule_path}"
+                    if sub_cls is not None:
+                        return None, (
+                            f"resolved via submodule but still a Placeholder "
+                            f"— required backend (torch) is likely not "
+                            f"importable in this environment"
+                        )
+                except Exception as e:
+                    return None, f"submodule import failed: {e}"
+
+            return None, "not found at top-level and no submodule fallback registered"
+
+        model         = None
+        last_error    = None
+        skip_reasons:  List[str] = []
+        attempt_errors: List[Tuple[str, str]] = []   # (cls_name, error_str) for EVERY real attempt
+
+        for cls_name in class_order:
+            cls, note = _resolve_class(cls_name)
+            if cls is None:
+                skip_reasons.append(f"{cls_name} ({note})")
+                logger.warning(
+                    f"[Training] Class {cls_name} unavailable — {note}. Skipping."
                 )
                 continue
             try:
                 model = cls.from_pretrained(**load_kw)
-                logger.info(f"[Training] {hf_id} loaded with {cls_name}")
+                logger.info(
+                    f"[Training] {hf_id} loaded with {cls_name} ({note})"
+                )
                 break
             except Exception as e:
                 last_error = e
-                logger.debug(f"[Training] {cls_name} failed for {hf_id}: {e}")
+                attempt_errors.append((cls_name, str(e)))
+                logger.warning(f"[Training] {cls_name} load failed for {hf_id}: {e}")
 
         if model is None:
+            reason_block = (
+                "; ".join(skip_reasons) if skip_reasons else "no classes skipped"
+            )
+
+            # The class the caller actually asked for (loader_hint) is the
+            # one whose error matters most — earlier versions of this agent
+            # only kept the LAST error in the chain, which is almost always
+            # the least relevant fallback (e.g. AutoModelForCausalLM), and
+            # silently buried the real reason the intended class failed.
+            # Surface the hinted class's own error explicitly here.
+            primary_error = next(
+                (err for name, err in attempt_errors if name == loader_hint),
+                None,
+            )
+
+            per_class_block = "\n".join(
+                f"  - {name}: {err[:300]}" for name, err in attempt_errors
+            ) or "  (no class was actually attempted — all were unavailable)"
+
+            primary_block = (
+                f"\nPRIMARY (requested loader '{loader_hint}') error:\n  {primary_error[:500]}\n"
+                if primary_error else
+                f"\nNote: requested loader '{loader_hint}' was never actually "
+                f"attempted (see skipped classes below) — this is itself "
+                f"likely the real problem.\n"
+            )
+
             raise RuntimeError(
-                f"Cannot load {hf_id}. Last error: {last_error}"
+                f"Cannot load {hf_id} with any class in {class_order}.\n"
+                f"Skipped (unavailable) classes: {reason_block}\n"
+                f"{primary_block}"
+                f"All attempted classes and their errors:\n{per_class_block}\n"
+                f"Last error (informational only — see PRIMARY above for the "
+                f"actual relevant failure): {last_error}"
             )
 
         for method in ("gradient_checkpointing_enable", "enable_input_require_grads"):
