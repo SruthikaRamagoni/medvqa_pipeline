@@ -625,19 +625,98 @@ class TrainingAgent:
 
         if "pixel_values" in train_ds.column_names:
             try:
-                sample = train_ds[0]["pixel_values"]
-                if (isinstance(sample, list) and
-                        len(sample) == 1 and
-                        isinstance(sample[0], list)):
-                    def unwrap_pixel(batch):
-                        return {"pixel_values": [pv[0] for pv in batch["pixel_values"]]}
-                    train_ds = train_ds.map(unwrap_pixel, batched=True)
-                    val_ds   = val_ds.map(unwrap_pixel,   batched=True)
-                    logger.info("[Training] Unwrapped nested pixel_values.")
+                train_ds, val_ds = self._normalize_pixel_values(
+                    train_ds, val_ds, column="pixel_values"
+                )
             except Exception as e:
-                logger.debug(f"[Training] pixel_values check skipped: {e}")
+                logger.warning(f"[Training] pixel_values normalization skipped: {e}")
 
         logger.info(f"[Training] Final columns: {train_ds.column_names}")
+        return train_ds, val_ds
+
+    def _normalize_pixel_values(self, train_ds, val_ds, column: str = "pixel_values"):
+        """
+        Ensure `column` is exactly 3D per example: (channels, height, width).
+
+        ROOT CAUSE OF "too many values to unpack (expected 4)":
+        The old logic did a single fixed unwrap (`pv[0]`) based on a single
+        nesting check, which is correct ONLY if the column is exactly one
+        level too deep. If FeatureEngineeringAgent's processor call wrapped
+        the image in an extra list (e.g. producing shape (1, 1, 3, H, W) or
+        even (1, 1, 1, 3, H, W) per row instead of (3, H, W)), a single
+        unwrap pass leaves a residual singleton dimension. The Trainer then
+        collates a batch into a 5D (or higher) tensor instead of the 4D
+        (batch, channels, height, width) InstructBLIP's vision encoder /
+        Q-Former expects internally — and code doing
+        `B, C, H, W = pixel_values.shape` inside the model raises exactly
+        "too many values to unpack (expected 4)".
+
+        Fix: instead of a single fixed-depth unwrap, repeatedly strip
+        leading singleton dimensions (via torch tensor rank, not list
+        nesting guesses) until each example is exactly rank-3 (C, H, W).
+        This is robust regardless of how many extra wrapping levels were
+        introduced upstream.
+        """
+        import torch
+
+        sample = train_ds[0][column]
+        t = torch.as_tensor(sample)
+        original_shape = tuple(t.shape)
+        logger.info(f"[Training] {column} per-example shape before normalize: {original_shape}")
+
+        # Determine how many leading singleton dims to strip so the
+        # remaining rank is exactly 3 (C, H, W).
+        strips_needed = max(0, t.dim() - 3)
+
+        if strips_needed == 0 and t.dim() == 3:
+            logger.info(f"[Training] {column} already correct rank (3) — no normalization needed.")
+            return train_ds, val_ds
+
+        if t.dim() < 3:
+            logger.warning(
+                f"[Training] {column} has rank {t.dim()} (< 3) — cannot "
+                f"normalize automatically. Leaving as-is; expect a shape "
+                f"error downstream if this is wrong."
+            )
+            return train_ds, val_ds
+
+        def _strip_leading_singletons(arr, n: int):
+            """Strip n leading dims of size 1 from a nested-list array."""
+            for _ in range(n):
+                if isinstance(arr, list) and len(arr) == 1:
+                    arr = arr[0]
+                else:
+                    # Shape didn't match expectation (non-singleton or not a
+                    # list) — stop early rather than corrupt the data.
+                    break
+            return arr
+
+        def normalize_batch(batch):
+            return {
+                column: [
+                    _strip_leading_singletons(pv, strips_needed)
+                    for pv in batch[column]
+                ]
+            }
+
+        train_ds = train_ds.map(normalize_batch, batched=True)
+        val_ds   = val_ds.map(normalize_batch,   batched=True)
+
+        # Verify the fix actually worked before declaring success.
+        new_sample = train_ds[0][column]
+        new_shape  = tuple(torch.as_tensor(new_sample).shape)
+        logger.info(
+            f"[Training] {column} normalized: {original_shape} → {new_shape} "
+            f"(stripped {strips_needed} leading singleton dim(s))"
+        )
+        if len(new_shape) != 3:
+            logger.warning(
+                f"[Training] {column} still not rank-3 after normalization "
+                f"(got {new_shape}). Training may still fail with a shape "
+                f"error — inspect FeatureEngineeringAgent's image encoding "
+                f"step for this model family."
+            )
+
         return train_ds, val_ds
 
     # ── Trainer ───────────────────────────────────────────────────────────────
