@@ -136,8 +136,12 @@ class FeatureEngineeringAgent:
         train_ds, val_ds = self._build_hf_datasets(encoded)
 
         # Step 6: Save to disk
-        feature_path = self._save_to_disk(train_ds, val_ds, hf_id)
-
+        
+        feature_path = self._save_to_disk(
+            train_ds,
+            val_ds,
+            hf_id + "_" + model_family
+        )
         logger.info(
             f"[FeatureEng] Done. Train={len(train_ds)}  Val={len(val_ds)}  "
             f"Path={feature_path}"
