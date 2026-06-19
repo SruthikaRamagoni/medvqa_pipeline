@@ -4,9 +4,9 @@ agents/model_selection_agent.py
 ModelSelectionAgent — scores and selects the best open-source VQA model
 architecture based on hardware, dataset size, and modality.
 
-Enhanced version: Enforces a strict schema contract containing structural tokens
-required by both FeatureEngineeringAgent and TrainingAgent. Implements comprehensive
-heuristic exclusions and LLM fallback paths for robust recovery.
+Enhanced version: Enforces an explicit configuration contract containing all keys
+demanded by FeatureEngineeringAgent and TrainingAgent, while integrating robust
+fallback rules when handling previous failure metrics.
 """
 
 from phi.agent import Agent
@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 logger = logging.getLogger(__name__)
 
-# Fallback catalog in case global settings are unavailable
-MODEL_CATALOGUE = {
+# System-wide architecture dictionary matching explicit deployment contracts
+MODEL_CATALOGUE_DATA = {
     "Salesforce/instructblip-vicuna-7b": {
         "name": "InstructBLIP-Vicuna-7B",
         "architecture": "Vision2Seq",
@@ -68,9 +68,8 @@ MODEL_CATALOGUE = {
 
 class ModelSelectionAgent:
     """
-    Selects the best model for Medical VQA training based on
-    GPU VRAM, dataset size, and imaging modality.
-    Supports contract compliance and self-recovering execution hooks.
+    Selects the optimal model plan for Medical VQA training based on
+    system hardware metrics, dataset specifications, and historical run failures.
     """
 
     def __init__(self, model_id: str = "llama-3.1-8b-instant"):
@@ -78,11 +77,11 @@ class ModelSelectionAgent:
             name="ModelSelectionAgent",
             model=Groq(id=model_id),
             instructions=[
-                "You are an expert ML Infrastructure Architect specializing in Medical VQA systems.",
-                "Your objective is to examine hardware constraints, modality requirements, and failure lists,",
-                "and select the optimal structural execution profile.",
-                "You MUST return your output strictly inside a valid JSON markdown block.",
-                "Ensure your returned parameters are syntactically aligned to the architecture requirements."
+                "You are an expert ML Systems Architect specializing in Medical VQA setups.",
+                "Your objective is to evaluate hardware details, image characteristics, and error arrays,",
+                "and select the best matching model execution schema from the candidate database.",
+                "You MUST return the schema strictly formatted inside a single JSON markdown wrapper block.",
+                "Do not include extra explanations, prose, or unformatted text outside of the JSON payload."
             ]
         )
 
@@ -91,36 +90,45 @@ class ModelSelectionAgent:
         dataset_size: int,
         modality: str,
         failed_models: Optional[List[str]] = None,
-        failure_reason: str = ""
+        failure_reason: str = "",
+        failure_context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Dynamically applies hard heuristic filters to exclude crashing architectures
-        and scores remaining models to return a fully compliant pipeline configuration.
+        Filters out failing architectures, re-scores remaining model candidates,
+        and returns a complete compatibility contract block.
         """
         if failed_models is None:
             failed_models = []
 
-        logger.info(f"Selecting model for Modality: {modality}, Dataset Size: {dataset_size}")
-        if failed_models:
-            logger.warning(f"Excluding previously failed models: {failed_models}. Reason: {failure_reason}")
+        # Handle backward compatibility with older orchestration scripts passing a dict context
+        if failure_context and isinstance(failure_context, dict):
+            failed_id = failure_context.get("failed_hf_id") or failure_context.get("failed_model")
+            if failed_id and failed_id not in failed_models:
+                failed_models.append(failed_id)
+            if not failure_reason:
+                failure_reason = failure_context.get("reason", "")
 
-        # Step 1: Filter remaining eligible models
-        eligible_candidates = {}
-        for hf_id, metadata in MODEL_CATALOGUE.items():
+        logger.info(f"Selecting VQA model layout for Modality: {modality}, Size: {dataset_size}")
+        if failed_models:
+            logger.warning(f"Excluding known problematic models from execution scope: {failed_models}. Reason: {failure_reason}")
+
+        # Filter out broken pipelines based on explicit parameters
+        active_candidates = {}
+        for hf_id, properties in MODEL_CATALOGUE_DATA.items():
             if hf_id in failed_models:
                 continue
             
-            # If previous model encountered OOM, downscale target batch configurations safely
-            candidate_config = metadata.copy()
+            candidate_map = properties.copy()
+            # If historical data signals an out of memory limit, systematically dial down parameters safely
             if "OOM" in failure_reason or "out of memory" in failure_reason.lower():
-                candidate_config["batch_size"] = max(1, candidate_config["batch_size"] // 2)
-                candidate_config["lora_r"] = max(4, candidate_config["lora_r"] // 2)
+                candidate_map["batch_size"] = max(1, candidate_map["batch_size"] // 2)
+                candidate_map["lora_r"] = max(4, candidate_map["lora_r"] // 2)
 
-            eligible_candidates[hf_id] = candidate_config
+            active_candidates[hf_id] = candidate_map
 
-        # Absolute Fallback if all standard candidates are excluded
-        if not eligible_candidates:
-            logger.critical("All catalogue entries exhausted or failed. Initiating fallback safety text model.")
+        # Absolute fallback defense if all tracking architectures are spent
+        if not active_candidates:
+            logger.critical("All catalogue candidates are disqualified. Activating baseline Seq2Seq safety configuration.")
             return {
                 "hf_id": "google/flan-t5-base",
                 "name": "Flan-T5-Base",
@@ -131,51 +139,48 @@ class ModelSelectionAgent:
                 "feature_strategy": "Seq2Seq",
                 "collator_type": "DataCollatorForSeq2Seq",
                 "batch_size": 4,
-                "epochs": 3,
+                "epochs": 2,
                 "lora_r": 8,
                 "target_modules": ["q", "v"]
             }
 
-        # Step 2: Use Agent LLM context parsing to score the remaining eligible candidates
         prompt = (
-            f"Select the absolute best model profile from the following eligible choices dictionary:\n"
-            f"{json.dumps(eligible_candidates, indent=2)}\n\n"
-            f"Context details:\n"
-            f"- Modality: {modality}\n"
-            f"- Dataset Size: {dataset_size}\n"
-            f"- Failure History: {failed_models}\n"
-            f"- Last Failure Reason: '{failure_reason}'\n\n"
-            f"Return ONLY the complete raw JSON object matching the chosen model configuration structure. "
-            f"Do not truncate parameters or include prose explanations outside the JSON block."
+            f"Select the best single model contract from the following eligible candidate matrix:\n"
+            f"{json.dumps(active_candidates, indent=2)}\n\n"
+            f"Target Environment Constraints:\n"
+            f"- Modality Target: {modality}\n"
+            f"- Records count: {dataset_size}\n"
+            f"- Disqualified list: {failed_models}\n"
+            f"- Triggering exception trace: '{failure_reason}'\n\n"
+            f"Return the chosen entry with its structural keys completely preserved. Include the model's identifier "
+            f"as the value for the 'hf_id' field inside the root of your JSON object response."
         )
 
         try:
             response = self.agent.run(prompt)
-            parsed_config = self._parse_response(response)
-            if parsed_config and "hf_id" in parsed_config:
-                parsed_config["hf_id"] = str(parsed_config["hf_id"])
-                return parsed_config
+            parsed_block = self._parse_response(response)
+            if parsed_block and "hf_id" in parsed_block:
+                return parsed_block
         except Exception as e:
-            logger.error(f"Error invoking model selection agent LLM: {e}. Using deterministic fallback.")
+            logger.error(f"Error resolving agent LLM recommendations: {e}. Defaulting to deterministic selection.")
 
-        # Fallback choice parsing
-        first_available_id = list(eligible_candidates.keys())[0]
-        selected = eligible_candidates[first_available_id]
-        selected["hf_id"] = first_available_id
-        return selected
+        # Backup deterministic fallback selection from remaining dictionary elements
+        fallback_id = list(active_candidates.keys())[0]
+        selected_plan = active_candidates[fallback_id]
+        selected_plan["hf_id"] = fallback_id
+        return selected_plan
 
     def _parse_response(self, response) -> Dict[str, Any]:
         try:
             text = response.content if hasattr(response, "content") else str(response)
-            match = re.search(r'\{.*\}', text, re.DOTALL)
-            if match:
-                return json.loads(match.group())
+            json_pattern = re.search(r'\{.*\}', text, re.DOTALL)
+            if json_pattern:
+                return json.loads(json_pattern.group())
         except Exception as e:
-            logger.error(f"Failed to parse selection payload: {e}")
+            logger.error(f"Failed parsing selected model structure string map: {e}")
         return {}
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     selector = ModelSelectionAgent()
-    print("Test Normal Selection:")
-    print(json.dumps(selector.select_model(3515, "X-Ray"), indent=2))
+    print(json.dumps(selector.select_model(2244, "X-Ray"), indent=2))
