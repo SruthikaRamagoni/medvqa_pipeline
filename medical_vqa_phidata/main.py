@@ -16,6 +16,24 @@ Run:
     python main.py --image image.jpg --question "Is there pneumonia?"
     python main.py --image image.jpg --question "..." --dry-run
     python main.py --image image.jpg --question "..." --skip-training --checkpoint ./artifacts/checkpoints/Flan-T5-Base
+
+FIX (this revision):
+    main.py previously passed a single `--groq-model` text-reasoning model ID
+    (default: llama-3.1-8b-instant) into EVERY agent, including
+    ModalityDiscoveryAgent. That agent's low-confidence fallback path needs a
+    *vision-capable* Groq model to actually look at the image — but it was
+    always being constructed with the shared text-only reasoning model,
+    which Groq rejects for image+text payloads with a 400
+    ("messages[1].content must be a string"). The agent's internal
+    `VISION_MODEL_ID` default was therefore always being silently
+    overridden and never took effect.
+
+    Fix: ModalityDiscoveryAgent is now constructed WITHOUT passing `model_id`,
+    so it uses its own internal vision-capable default
+    (meta-llama/llama-4-scout-17b-16e-instruct as of this writing). A new
+    `--vision-model` CLI flag lets you override that independently of
+    `--groq-model`, which still controls the text-reasoning model used by
+    every other agent.
 """
 
 import argparse, json, logging, sys
@@ -84,7 +102,15 @@ def parse_args():
     p.add_argument("--question",      required=True,
                    help="Clinical question about the image")
     p.add_argument("--groq-model",    default="llama-3.1-8b-instant",
-                   help="Groq model ID for agent reasoning")
+                   help="Groq TEXT-reasoning model ID used by every agent "
+                        "EXCEPT ModalityDiscoveryAgent's vision fallback "
+                        "(see --vision-model).")
+    p.add_argument("--vision-model",  default=None,
+                   help="Groq VISION-capable model ID used only by "
+                        "ModalityDiscoveryAgent's low-confidence fallback. "
+                        "If omitted, the agent's own internal default is "
+                        "used. Must be a model that accepts image input — "
+                        "passing a text-only model here will 400.")
     p.add_argument("--max-samples",   type=int, default=5000,
                    help="Maximum dataset samples to use")
     p.add_argument("--dry-run",       action="store_true",
@@ -107,7 +133,9 @@ def run_pipeline(args) -> PipelineState:
 
     logger.info(f"Hardware: device={hw['device']}  "
                 f"VRAM={hw['vram_gb']:.1f}GB  RAM={hw['ram_gb']:.1f}GB")
-    logger.info(f"Groq model for agents: {m}")
+    logger.info(f"Groq text-reasoning model for agents: {m}")
+    if args.vision_model:
+        logger.info(f"Groq vision model override: {args.vision_model}")
 
     state = PipelineState(
         image_path=args.image,
@@ -122,11 +150,27 @@ def run_pipeline(args) -> PipelineState:
 
     # ── STEP 1 — Modality Discovery ───────────────────────────────────────────
     _banner(logger, "STEP 1 — Modality Discovery")
-    modality_agent  = ModalityDiscoveryAgent(model_id=m)
+    # IMPORTANT: do NOT pass the shared text-reasoning model `m` here.
+    # ModalityDiscoveryAgent's low-confidence path needs a vision-capable
+    # model to actually see the image; the shared `--groq-model` default
+    # (llama-3.1-8b-instant) is text-only and will 400 on image+text
+    # payloads ("messages[1].content must be a string"). Only pass an
+    # explicit override if the user supplied --vision-model; otherwise let
+    # the agent use its own internal vision-capable default.
+    modality_agent_kwargs = {}
+    if args.vision_model:
+        modality_agent_kwargs["model_id"] = args.vision_model
+    modality_agent  = ModalityDiscoveryAgent(**modality_agent_kwargs)
     modality_result = modality_agent.discover_modality(args.image, args.question)
     state.modality  = modality_result.get("modality", "Unknown")
     state.log(f"Modality: {state.modality}  "
                f"(conf={modality_result.get('confidence', 0):.2f})")
+    if modality_result.get("error"):
+        # Surface vision-call failures loudly rather than letting them slide
+        # by silently as a low-confidence "Unknown" with no trace in the
+        # pipeline summary.
+        state.errors.append(f"modality_discovery: {modality_result['error']}")
+        logger.warning(f"Modality discovery degraded: {modality_result['error']}")
 
     # ── STEP 2 — Data Discovery ───────────────────────────────────────────────
     _banner(logger, "STEP 2 — Data Discovery")
@@ -211,21 +255,21 @@ def run_pipeline(args) -> PipelineState:
             model_plan=model_plan,
             device=state.device,
         )
-       
+
         if training_result.get("status") == "failed":
-    
+
             state.retry_count += 1
             state.failure_reason = training_result.get("failure_reason", "")
             state.previous_models.append(
                 training_result.get("model_used", "")
             )
-        
+
             while state.retry_count <= MAX_MODEL_RETRIES:
-        
+
                 logger.warning(
                     f"Retry {state.retry_count}/{MAX_MODEL_RETRIES}"
                 )
-        
+
                 retry_plan = model_sel_agent.select_model(
                     dataset_size=collection_result["records_count"],
                     modality=state.modality,
@@ -234,43 +278,43 @@ def run_pipeline(args) -> PipelineState:
                         "reason": training_result.get("failure_reason", ""),
                     },
                 )
-        
+
                 fe_result = fe_agent.engineer_features(
                     processed_data_path=state.processed_data_path,
                     model_plan=retry_plan,
                     device=state.device,
                 )
-        
+
                 if fe_result.get("status") == "failed":
                     state.errors.append(
                         fe_result.get("message", "")
                     )
                     break
-        
+
                 training_result = training_agent.train(
                     feature_path=fe_result["feature_path"],
                     model_plan=retry_plan,
                     device=state.device,
                 )
-        
+
                 if training_result.get("status") != "failed":
-        
+
                     state.model_hf_id = retry_plan["hf_id"]
                     state.model_name = retry_plan["name"]
                     state.model_architecture = retry_plan["architecture"]
                     state.model_vision = retry_plan["vision"]
-        
+
                     state.checkpoint_path = (
                         training_result["checkpoint_path"]
                     )
-        
+
                     break
-        
+
                 state.retry_count += 1
                 state.previous_models.append(
                     training_result.get("model_used", "")
                 )
-        
+
             if training_result.get("status") == "failed":
                 state.errors.append(
                     training_result.get("failure_reason", "")
@@ -279,7 +323,6 @@ def run_pipeline(args) -> PipelineState:
                 return state
 
 
-      
         state.checkpoint_path = training_result["checkpoint_path"]
         state.log(
             f"Training done. Loss={training_result.get('train_loss','N/A')}  "
@@ -334,7 +377,9 @@ def main():
     logger.info("="*60)
     logger.info(f"  Image    : {args.image}")
     logger.info(f"  Question : {args.question}")
-    logger.info(f"  Groq LLM : {args.groq_model}")
+    logger.info(f"  Groq LLM (text reasoning) : {args.groq_model}")
+    logger.info(f"  Groq LLM (vision, modality discovery) : "
+                f"{args.vision_model or '<agent default>'}")
     logger.info(f"  Dry-run  : {args.dry_run}")
 
     state = run_pipeline(args)
