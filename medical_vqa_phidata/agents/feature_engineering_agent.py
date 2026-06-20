@@ -443,29 +443,48 @@ class FeatureEngineeringAgent:
 
     def _flatten_sequence_fields(self, entry: Dict) -> Dict:
         """
-        Normalize 'input_ids' / 'attention_mask' / 'labels' to a flat
-        per-example list[int] (rank 1), regardless of how the underlying
-        HF processor shaped them.
+        Normalize every tensor-bound field to its per-example shape
+        (stripping a stray outer batch-of-one wrapping), regardless of how
+        the underlying HF processor shaped them.
 
-        ROOT CAUSE this fixes: several processors (notably Qwen2.5-VL's
-        AutoProcessor, even when called with return_tensors=None) still
-        return these fields as a batch-of-one nested list — [[id, id, ...]]
-        instead of [id, id, ...] — because the processor always treats its
-        input as a batch internally. Saving that nested shape directly into
-        the HF Dataset means torch.as_tensor() on a single example yields
-        rank 2 instead of rank 1, which is exactly the
-        "input_ids rank 2 (expected 1)" schema-validation failure
-        TrainingAgent reported. Squeezing it here, once, at the only place
-        all encoders funnel through, keeps every downstream consumer
-        (TrainingAgent's validator, the Qwen-VL collator, default_data_collator)
-        working with a single consistent per-example rank-1 contract.
+        ROOT CAUSE this fixes: HF processors always treat their input as a
+        batch internally, even for a single example. With
+        return_tensors=None this surfaces as a length-1 outer list wrapping
+        the real per-example value — e.g. input_ids as [[id, id, ...]]
+        instead of [id, id, ...], or pixel_values as [array(3,224,224)]
+        instead of array(3,224,224). Saving that wrapped shape straight
+        into the HF Dataset corrupts the per-example rank seen by every
+        downstream consumer:
+          - input_ids/attention_mask/labels: torch.as_tensor() on a single
+            saved example yields rank 2 instead of rank 1
+            ("input_ids rank 2 (expected 1)" schema-validation failure).
+          - pixel_values: the SAME outer wrapping previously broke
+            _validate_entry()'s rank check in a more subtle way — its
+            torch.as_tensor() fallback (_shape_of) walks `while
+            isinstance(cur, list)`, and once it hits the single wrapped
+            numpy array it stops immediately, reporting "rank=1" even
+            though the real image tensor inside is rank 3. That made every
+            InstructBLIP/BLIP-2/LLaVA/Phi-vision record look invalid even
+            though the underlying encoding was correct.
+
+        Unwrapping all of these here, once, at the only place every
+        encoder funnels through, keeps every downstream consumer
+        (TrainingAgent's validator, the Qwen-VL collator,
+        default_data_collator, _validate_entry below) working with a
+        single consistent per-example-shape contract.
         """
-        for key in ("input_ids", "attention_mask", "labels"):
+        import numpy as np
+
+        def _is_batch_of_one_wrapper(val) -> bool:
+            return isinstance(val, list) and len(val) == 1 and isinstance(
+                val[0], (list, np.ndarray)
+            )
+
+        for key in ("input_ids", "attention_mask", "labels",
+                    "pixel_values", "image_grid_thw",
+                    "qformer_input_ids", "qformer_attention_mask"):
             val = entry.get(key)
-            if (
-                isinstance(val, list) and len(val) == 1
-                and isinstance(val[0], list)
-            ):
+            if _is_batch_of_one_wrapper(val):
                 entry[key] = val[0]
         return entry
 
@@ -698,12 +717,24 @@ class FeatureEngineeringAgent:
 
 
 def _shape_of(x) -> List[int]:
-    """Pure-python nested-list shape inference (fallback when torch unavailable)."""
-    shape = []
+    """
+    Pure-python shape inference, used only as a fallback when torch is
+    unavailable. Handles plain nested python lists AND numpy/torch arrays
+    (which commonly appear as the innermost element of a processor's
+    output) — without this, hitting an array mid-walk would stop the walk
+    immediately and misreport a multi-dimensional value as rank 1.
+    """
+    shape: List[int] = []
     cur = x
-    while isinstance(cur, list):
-        shape.append(len(cur))
-        cur = cur[0] if cur else None
+    while True:
+        if hasattr(cur, "shape"):
+            shape.extend(list(cur.shape))
+            break
+        if isinstance(cur, list):
+            shape.append(len(cur))
+            cur = cur[0] if cur else None
+        else:
+            break
     return shape
 
 
