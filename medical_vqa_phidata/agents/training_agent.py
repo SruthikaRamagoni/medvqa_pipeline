@@ -586,6 +586,63 @@ class TrainingAgent:
         }
         class_order = CLASS_MAP.get(loader_hint, CLASS_MAP["auto"])
 
+        # ── Architecture compatibility gate ─────────────────────────────────
+        # ROOT CAUSE FIX: cls.from_pretrained() does NOT validate that the
+        # checkpoint's actual architecture matches the class you call it on.
+        # Calling InstructBlipForConditionalGeneration.from_pretrained() on a
+        # Qwen2.5-VL checkpoint does NOT raise — it silently loads whatever
+        # tensor names happen to coincide and randomly initializes the rest
+        # ("This checkpoint seem corrupted" + dozens of MISSING/UNEXPECTED
+        # keys), producing a nonsense hybrid model that only fails later,
+        # deep in the training loop, with a misleading error
+        # ("forward() missing 1 required positional argument:
+        # 'qformer_input_ids'") that has nothing to do with the real problem.
+        #
+        # Fix: resolve the checkpoint's real `model_type` via AutoConfig
+        # ONCE, then skip any explicit (non-Auto) class whose expected
+        # model_type doesn't match BEFORE ever calling its from_pretrained().
+        # AutoModelFor* classes are exempt from this gate — they resolve the
+        # correct architecture from the config themselves and are safe by
+        # construction.
+        EXPLICIT_CLASS_MODEL_TYPES: Dict[str, set] = {
+            "InstructBlipForConditionalGeneration": {"instructblip"},
+            "Blip2ForConditionalGeneration":          {"blip-2", "blip_2"},
+            "Qwen2_5_VLForConditionalGeneration":     {"qwen2_5_vl"},
+            "Qwen2VLForConditionalGeneration":        {"qwen2_vl"},
+        }
+
+        checkpoint_model_type = ""
+        try:
+            from transformers import AutoConfig
+            cfg = AutoConfig.from_pretrained(hf_id, trust_remote_code=True)
+            checkpoint_model_type = getattr(cfg, "model_type", "") or ""
+            logger.info(f"[Training] {hf_id} checkpoint model_type='{checkpoint_model_type}'")
+        except Exception as e:
+            logger.warning(
+                f"[Training] Could not pre-fetch config.model_type for {hf_id} "
+                f"({e}) — architecture compatibility gate will be skipped for "
+                f"this load (falls back to try/except behaviour)."
+            )
+
+        def _architecture_compatible(cls_name: str) -> bool:
+            expected = EXPLICIT_CLASS_MODEL_TYPES.get(cls_name)
+            if expected is None:
+                return True  # AutoModelFor* — safe by construction
+            if not checkpoint_model_type:
+                return True  # couldn't determine — don't block, fall through to try/except
+            return checkpoint_model_type in expected
+
+        filtered_class_order = [c for c in class_order if _architecture_compatible(c)]
+        gated_out = [c for c in class_order if c not in filtered_class_order]
+        if gated_out:
+            logger.info(
+                f"[Training] Architecture gate excluded {gated_out} — "
+                f"checkpoint model_type='{checkpoint_model_type}' does not "
+                f"match their expected type(s). This prevents loading "
+                f"{hf_id} with the wrong model class."
+            )
+        class_order = filtered_class_order or class_order  # never end up with an empty list
+
         SUBMODULE_FALLBACKS: Dict[str, str] = {
             "InstructBlipForConditionalGeneration": "transformers.models.instructblip",
             "Blip2ForConditionalGeneration": "transformers.models.blip_2",
