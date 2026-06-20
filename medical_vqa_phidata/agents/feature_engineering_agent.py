@@ -150,7 +150,15 @@ class FeatureEngineeringAgent:
             # v4: qwen_vl effective max_len auto-resolution (image-token
             #     expansion could make prompt_len saturate at max_len,
             #     masking 100% of labels when max_seq_len was too small).
-            "label_masking_version": 4,
+            # v5: max_len probe AND _encode_qwen_vl's true_prompt_len /
+            #     result["input_ids"] now route through _unwrap_token_ids.
+            #     Without it, return_tensors=None processor output wrapped
+            #     as [[id,id,...]] made every length check measure the
+            #     outer wrapper (=1) instead of the real token count —
+            #     v4's probe always reported "1 token", never resized
+            #     max_len, and the original all-masked-labels bug
+            #     persisted even with v4 in place.
+            "label_masking_version": 5,
         }
 
         feature_path = self._feature_path_for(hf_id, model_family)
@@ -349,6 +357,52 @@ class FeatureEngineeringAgent:
 
     # ── Label masking helper (NEW) ───────────────────────────────────────────
 
+    def _unwrap_token_ids(self, val) -> List[int]:
+        """
+        Given a processor/tokenizer's `input_ids` output for a SINGLE
+        example (with return_tensors=None), return the flat list of real
+        token ids — regardless of how many extra batch-of-one wrapper
+        layers the processor added around it.
+
+        ROOT CAUSE this fixes: HF processors/tokenizers always treat their
+        input as a batch internally. For a single example with
+        return_tensors=None, this commonly surfaces as input_ids shaped
+        like [[id, id, id, ...]] (or even more nested) instead of a flat
+        [id, id, id, ...]. Calling plain `len(enc["input_ids"])` on that —
+        as a naive length check would — measures the OUTER wrapper's
+        length (almost always 1), not the real token count.
+
+        This exact bug appeared twice independently in this file: once in
+        the original (now-fixed) label-masking code, and again in
+        _resolve_effective_max_len's prompt-length probe, which doesn't go
+        through any encoder-side unwrapping and used a raw `len(...)` —
+        causing the probe to report "worst-case sampled prompt=1 tokens"
+        regardless of the real (e.g. 350+ token) image-expanded prompt
+        length, silently defeating the max_len auto-resize entirely.
+
+        Every call site that needs a token COUNT or the actual token
+        VALUES for a single example should route through this helper
+        rather than indexing/len()-ing the raw processor output directly.
+        """
+        cur = val
+        # Unwrap any number of length-1 list layers, but stop as soon as
+        # we hit a list whose first element is NOT itself a list (i.e.
+        # we've reached the actual flat token sequence) or stop if it's
+        # already empty / not a list at all.
+        while isinstance(cur, list) and len(cur) == 1 and isinstance(cur[0], list):
+            cur = cur[0]
+        if isinstance(cur, list):
+            return cur
+        # Fallback: numpy/torch array or similar — convert defensively.
+        try:
+            import numpy as np
+            arr = np.asarray(cur)
+            while arr.ndim > 1 and arr.shape[0] == 1:
+                arr = arr[0]
+            return arr.tolist()
+        except Exception:
+            return list(cur) if cur is not None else []
+
     def _mask_prompt_and_padding(self, input_ids: List[int], prompt_len: int,
                                   pad_token_id: Optional[int]) -> List[int]:
         """
@@ -436,7 +490,8 @@ class FeatureEngineeringAgent:
                     messages, tokenize=False, add_generation_prompt=True)
                 enc = processor(text=prompt_text, images=[image],
                                  return_tensors=None, truncation=False)
-                worst_case = max(worst_case, len(enc["input_ids"]))
+                real_tokens = self._unwrap_token_ids(enc["input_ids"])
+                worst_case = max(worst_case, len(real_tokens))
                 checked += 1
             except Exception as e:
                 logger.debug(f"[FeatureEng] max_len probe skipped a record: {e}")
@@ -854,10 +909,14 @@ class FeatureEngineeringAgent:
 
             # Measure the prompt's TRUE length (image tokens expanded, NOT
             # truncated) so we can tell whether it leaves room for any
-            # answer tokens within the dataset's fixed max_len.
+            # answer tokens within the dataset's fixed max_len. Must go
+            # through _unwrap_token_ids — with return_tensors=None a
+            # processor commonly wraps input_ids as [[id, id, ...]] for a
+            # single example, and a raw len() would measure that outer
+            # wrapper (always 1) instead of the real token count.
             prompt_only_enc = processor(text=prompt_text, images=[image],
                                          return_tensors=None, truncation=False)
-            true_prompt_len = len(prompt_only_enc["input_ids"])
+            true_prompt_len = len(self._unwrap_token_ids(prompt_only_enc["input_ids"]))
 
             if true_prompt_len + min_answer_tokens > max_len:
                 raise ValueError(
@@ -880,7 +939,7 @@ class FeatureEngineeringAgent:
         else:
             prompt_text = f"Question: {question}\nAnswer:"
             prompt_only_enc = tok(prompt_text, return_tensors=None, truncation=False)
-            true_prompt_len = len(prompt_only_enc["input_ids"])
+            true_prompt_len = len(self._unwrap_token_ids(prompt_only_enc["input_ids"]))
 
             if true_prompt_len + min_answer_tokens > max_len:
                 raise ValueError(
@@ -895,6 +954,16 @@ class FeatureEngineeringAgent:
                       truncation=True, max_length=max_len)
 
         result = {k: v for k, v in enc.items()}
+        # Unwrap input_ids/attention_mask BEFORE masking — `enc` (the
+        # padded encoding) can carry the same batch-of-one wrapping as the
+        # prompt-only probe above. Masking against a wrapped [[...]]
+        # sequence would operate on the outer 1-element wrapper instead of
+        # the real per-token sequence, producing garbage labels (this is
+        # the same class of bug that made _resolve_effective_max_len's
+        # probe report "1 token" instead of the real prompt length).
+        result["input_ids"] = self._unwrap_token_ids(result["input_ids"])
+        if "attention_mask" in result:
+            result["attention_mask"] = self._unwrap_token_ids(result["attention_mask"])
         pad_id = getattr(tok, "pad_token_id", None)
         result["labels"] = self._mask_prompt_and_padding(result["input_ids"], prompt_len, pad_id)
 
