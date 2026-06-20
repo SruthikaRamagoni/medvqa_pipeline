@@ -140,13 +140,17 @@ class FeatureEngineeringAgent:
             "feature_strategy":  model_plan.get("feature_strategy", self._default_feature_strategy(model_family)),
             "tensor_schema":     model_plan.get("tensor_schema", ""),
             "image_enabled":     bool(is_vision),
-            # Bumping this whenever the encoding/label-masking recipe, or
-            # the pixel_values rank-normalization logic, changes — so a
-            # stale cache from before a fix is never silently reused.
+            # Bumping this whenever the encoding/label-masking recipe, the
+            # pixel_values rank-normalization logic, or the effective
+            # max_len resolution changes — so a stale cache from before a
+            # fix is never silently reused.
             # v2: label masking fix (prompt/padding -> -100).
             # v3: pixel_values multi-layer unwrap fix (InstructBLIP rank-5
             #     bug — raw numpy arrays weren't being unwrapped at all).
-            "label_masking_version": 3,
+            # v4: qwen_vl effective max_len auto-resolution (image-token
+            #     expansion could make prompt_len saturate at max_len,
+            #     masking 100% of labels when max_seq_len was too small).
+            "label_masking_version": 4,
         }
 
         feature_path = self._feature_path_for(hf_id, model_family)
@@ -373,9 +377,116 @@ class FeatureEngineeringAgent:
 
     # ── Encoding ──────────────────────────────────────────────────────────────
 
+    # Hard ceiling for the auto-resolved max_len (see _resolve_effective_max_len).
+    # Exists purely as a safety bound against runaway sequence length /
+    # memory use on unusually large images, not because typical medical
+    # images should ever approach it.
+    _QWEN_VL_MAX_LEN_CEILING = 2048
+
+    def _resolve_effective_max_len(
+        self, records: List[Dict], processor, model_family: str, max_len: int,
+        sample_size: int = 20,
+    ) -> int:
+        """
+        For vision-chat families whose processor expands a single image
+        placeholder into many image-patch tokens internally (currently:
+        qwen_vl), the configured model_plan['max_seq_len'] can be far too
+        small to even fit the prompt, let alone any answer — e.g. 128
+        tokens (a reasonable default for short text-only QA) vs. an
+        actual Qwen2.5-VL image-expanded prompt that can run several
+        hundred tokens or more depending on resolution.
+
+        Called ONCE per dataset, BEFORE the per-record encoding loop —
+        deliberately NOT per-record — because every record in the
+        resulting HF Dataset must share one fixed padded sequence length
+        for batching/collation to work; growing max_len mid-encode would
+        produce variable-length records that break torch.stack() in
+        TrainingAgent's collators.
+
+        Samples a handful of records' prompts (not the full dataset, to
+        keep this fast), measures their TRUE un-truncated token length,
+        and returns max(configured max_len, worst-case-sampled-prompt-len
+        + a small answer-token buffer), capped at
+        _QWEN_VL_MAX_LEN_CEILING. Returns max_len unchanged for families
+        that don't have this image-expansion behavior.
+        """
+        if model_family != "qwen_vl":
+            return max_len
+        if not hasattr(processor, "apply_chat_template"):
+            return max_len
+
+        min_answer_tokens = 32  # generous buffer so typical short VQA answers always fit
+        worst_case = 0
+        checked = 0
+
+        for rec in records:
+            if checked >= sample_size:
+                break
+            question = (rec.get("question") or "").strip()
+            if not question:
+                continue
+            image = self._resolve_record_image(rec)
+            if image is None:
+                continue
+            try:
+                messages = [{"role": "user", "content": [
+                    {"type": "image"}, {"type": "text", "text": question},
+                ]}]
+                prompt_text = processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True)
+                enc = processor(text=prompt_text, images=[image],
+                                 return_tensors=None, truncation=False)
+                worst_case = max(worst_case, len(enc["input_ids"]))
+                checked += 1
+            except Exception as e:
+                logger.debug(f"[FeatureEng] max_len probe skipped a record: {e}")
+                continue
+
+        if checked == 0:
+            logger.warning(
+                "[FeatureEng] Could not probe any record to resolve "
+                "qwen_vl's effective max_len (no usable image+question "
+                f"found in first {sample_size} records) — falling back to "
+                f"configured max_seq_len={max_len}."
+            )
+            return max_len
+
+        needed = worst_case + min_answer_tokens
+        if needed <= max_len:
+            logger.info(
+                f"[FeatureEng] qwen_vl max_len probe: worst-case sampled "
+                f"prompt={worst_case} tokens, fits within configured "
+                f"max_seq_len={max_len}. No adjustment needed."
+            )
+            return max_len
+
+        resolved = min(needed, self._QWEN_VL_MAX_LEN_CEILING)
+        if resolved < needed:
+            logger.warning(
+                f"[FeatureEng] qwen_vl max_len probe: worst-case sampled "
+                f"prompt={worst_case} tokens needs {needed} total, but "
+                f"that exceeds the safety ceiling of "
+                f"{self._QWEN_VL_MAX_LEN_CEILING}. Using the ceiling — "
+                f"some long-prompt records may still be skipped during "
+                f"encoding if their prompt alone exceeds this length."
+            )
+        else:
+            logger.info(
+                f"[FeatureEng] qwen_vl max_len probe: worst-case sampled "
+                f"prompt={worst_case} tokens exceeds configured "
+                f"max_seq_len={max_len}. Auto-raising effective max_len to "
+                f"{resolved} for this dataset so answer tokens are never "
+                f"truncated away entirely. Consider setting "
+                f"model_plan['max_seq_len'] >= {resolved} directly to "
+                f"avoid relying on this auto-resolution."
+            )
+        return resolved
+
     def _encode_records(
         self, records, processor, tokenizer, model_family, is_vision, architecture, max_len,
     ) -> List[Dict]:
+        max_len = self._resolve_effective_max_len(records, processor, model_family, max_len)
+
         encoded = []
         skipped = 0
         no_image_count = 0
@@ -693,14 +804,45 @@ class FeatureEngineeringAgent:
 
     def _encode_qwen_vl(self, question, answer, image, processor, max_len) -> Dict:
         """
-        FIXED: previously did `result["labels"] = input_ids[:]` (no
-        masking at all) — this was the primary cause of 0.0 eval metrics.
-        Now tokenizes the chat-template prompt alone (no answer appended)
-        to find exactly how many leading tokens are prompt/image/
-        scaffolding, then masks labels[:prompt_len] = -100 plus all
-        padding tokens. Only the answer span remains a real loss target.
+        FIXED (label masking): previously did `result["labels"] =
+        input_ids[:]` (no masking at all) — this was the primary cause of
+        0.0 eval metrics. Now tokenizes the chat-template prompt alone (no
+        answer appended) to find exactly how many leading tokens are
+        prompt/image/scaffolding, then masks labels[:prompt_len] = -100
+        plus all padding tokens. Only the answer span remains a real loss
+        target.
+
+        FIXED (this revision — all-masked-labels regression): Qwen2.5-VL's
+        chat template inserts a single <|image_pad|> placeholder that the
+        processor then EXPANDS into many image-patch tokens internally
+        (the count scales with image resolution and is NOT capped by
+        model_plan's max_seq_len — that cap only truncates the final
+        encoded sequence). With a small max_seq_len (e.g. 128, sized for
+        text-only models), the expanded image-token prompt alone can
+        exceed max_len before the answer ever appears. The previous
+        version measured prompt_len from an encoding that was ITSELF
+        truncated to max_len, so prompt_len silently saturated at exactly
+        max_len whenever this happened — and _mask_prompt_and_padding then
+        masked every single position (0..max_len-1), since all of them
+        satisfied `index < prompt_len`. Every record failed
+        FeatureEngineeringAgent's "fully masked" validator, and 100% of
+        records were skipped — encoding produced 0 valid records.
+
+        Fix: `max_len` passed in here is now expected to already be sized
+        correctly for this model (see _resolve_effective_max_len, called
+        once per dataset in _encode_records — NOT per record, since every
+        record in the dataset must share one fixed padded length for
+        batching to work). This method still measures the prompt's TRUE,
+        un-truncated length to compute the mask boundary, but no longer
+        tries to grow max_len itself mid-encode (that would produce
+        variable-length records that break collation). If a single
+        record's prompt is so long it still doesn't leave room for any
+        answer token even at the dataset-level max_len, that one record is
+        skipped explicitly with a clear reason instead of being silently
+        corrupted into an all-masked record.
         """
         tok = getattr(processor, "tokenizer", processor)
+        min_answer_tokens = 4  # floor: must leave room for at least a few answer tokens + EOS
 
         if image is not None and hasattr(processor, "apply_chat_template"):
             messages = [{"role": "user", "content": [
@@ -710,19 +852,43 @@ class FeatureEngineeringAgent:
                 messages, tokenize=False, add_generation_prompt=True)
             full_text = prompt_text + answer
 
-            # Tokenize prompt alone (same image, no answer) purely to
-            # measure its token length — this defines the mask boundary.
+            # Measure the prompt's TRUE length (image tokens expanded, NOT
+            # truncated) so we can tell whether it leaves room for any
+            # answer tokens within the dataset's fixed max_len.
             prompt_only_enc = processor(text=prompt_text, images=[image],
-                                         return_tensors=None, truncation=True,
-                                         max_length=max_len)
-            prompt_len = len(prompt_only_enc["input_ids"])
+                                         return_tensors=None, truncation=False)
+            true_prompt_len = len(prompt_only_enc["input_ids"])
+
+            if true_prompt_len + min_answer_tokens > max_len:
+                raise ValueError(
+                    f"qwen_vl prompt (image-expanded) is {true_prompt_len} "
+                    f"tokens, leaving no room for an answer within "
+                    f"max_seq_len={max_len}. Skipping this record. If this "
+                    f"happens for most/all records, model_plan['max_seq_len'] "
+                    f"is too small for this model's image resolution — it "
+                    f"should be resolved automatically by "
+                    f"_resolve_effective_max_len() before encoding starts; "
+                    f"seeing this error means that resolution step itself "
+                    f"needs a higher ceiling or this image is unusually "
+                    f"large."
+                )
+
+            prompt_len = min(true_prompt_len, max_len)
 
             enc = processor(text=full_text, images=[image], return_tensors=None,
                              padding="max_length", truncation=True, max_length=max_len)
         else:
             prompt_text = f"Question: {question}\nAnswer:"
-            prompt_only_enc = tok(prompt_text, return_tensors=None, truncation=True, max_length=max_len)
-            prompt_len = len(prompt_only_enc["input_ids"])
+            prompt_only_enc = tok(prompt_text, return_tensors=None, truncation=False)
+            true_prompt_len = len(prompt_only_enc["input_ids"])
+
+            if true_prompt_len + min_answer_tokens > max_len:
+                raise ValueError(
+                    f"Text-only prompt is {true_prompt_len} tokens, leaving "
+                    f"no room for an answer within max_seq_len={max_len}. "
+                    f"Skipping this record."
+                )
+            prompt_len = min(true_prompt_len, max_len)
 
             full_text = f"{prompt_text} {answer}"
             enc = tok(full_text, return_tensors=None, padding="max_length",
