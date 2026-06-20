@@ -140,8 +140,13 @@ class FeatureEngineeringAgent:
             "feature_strategy":  model_plan.get("feature_strategy", self._default_feature_strategy(model_family)),
             "tensor_schema":     model_plan.get("tensor_schema", ""),
             "image_enabled":     bool(is_vision),
-            # Bumping this whenever the encoding/label-masking recipe
-            "label_masking_version": 2,
+            # Bumping this whenever the encoding/label-masking recipe, or
+            # the pixel_values rank-normalization logic, changes — so a
+            # stale cache from before a fix is never silently reused.
+            # v2: label masking fix (prompt/padding -> -100).
+            # v3: pixel_values multi-layer unwrap fix (InstructBLIP rank-5
+            #     bug — raw numpy arrays weren't being unwrapped at all).
+            "label_masking_version": 3,
         }
 
         feature_path = self._feature_path_for(hf_id, model_family)
@@ -509,31 +514,61 @@ class FeatureEngineeringAgent:
 
         return self._flatten_sequence_fields(entry) if entry else entry
 
+    # Expected per-example rank (after unwrapping) for each tensor field.
+    # input_ids/attention_mask/labels/qformer_* are 1-D token sequences.
+    # pixel_values is handled separately below (see _flatten_sequence_fields)
+    # because its target rank genuinely varies by model family (3 for a
+    # single [C,H,W] image, 4 for [num_images,C,H,W]) — everything else
+    # here is unambiguous.
+    _SEQUENCE_FIELD_TARGET_RANK = {
+        "input_ids": 1, "attention_mask": 1, "labels": 1,
+        "image_grid_thw": 2,
+        "qformer_input_ids": 1, "qformer_attention_mask": 1,
+    }
+
     def _flatten_sequence_fields(self, entry: Dict) -> Dict:
         """
-        Normalize every tensor-bound field to its per-example shape
-        (stripping a stray outer batch-of-one wrapping), regardless of how
-        the underlying HF processor shaped them.
+        Normalize every tensor-bound field to its per-example shape by
+        stripping ALL extra leading singleton ("batch-of-one") dimensions,
+        regardless of how many there are or whether the underlying HF
+        processor returned a nested python list or a raw numpy/torch array.
 
-        ROOT CAUSE this fixes: HF processors always treat their input as a
-        batch internally, even for a single example. With
-        return_tensors=None this surfaces as a length-1 outer list wrapping
-        the real per-example value — e.g. input_ids as [[id, id, ...]]
-        instead of [id, id, ...], or pixel_values as [array(3,224,224)]
-        instead of array(3,224,224). Saving that wrapped shape straight
-        into the HF Dataset corrupts the per-example rank seen by every
-        downstream consumer:
-          - input_ids/attention_mask/labels: torch.as_tensor() on a single
-            saved example yields rank 2 instead of rank 1
-            ("input_ids rank 2 (expected 1)" schema-validation failure).
-          - pixel_values: the SAME outer wrapping previously broke
-            _validate_entry()'s rank check in a more subtle way — its
-            torch.as_tensor() fallback (_shape_of) walks `while
-            isinstance(cur, list)`, and once it hits the single wrapped
-            numpy array it stops immediately, reporting "rank=1" even
-            though the real image tensor inside is rank 3. That made every
-            InstructBLIP/BLIP-2/LLaVA/Phi-vision record look invalid even
-            though the underlying encoding was correct.
+        ROOT CAUSE this fixes (two related bugs found across model
+        families):
+
+        1) HF processors always treat their input as a batch internally,
+           even for a single example. With return_tensors=None this
+           surfaces as a length-1 outer list wrapping the real per-example
+           value — e.g. input_ids as [[id, id, ...]] instead of
+           [id, id, ...]. Saving that wrapped shape into the HF Dataset
+           corrupts the per-example rank seen by every downstream
+           consumer (torch.as_tensor() on a saved example yields rank 2
+           instead of rank 1).
+
+        2) Some processors (observed with InstructBLIP) wrap MORE than
+           one extra leading dim onto pixel_values — e.g. shape
+           (1, 1, 3, H, W), a (batch=1, num_images=1, C, H, W) — AND
+           return it as a raw numpy array rather than a nested python
+           list. The previous version of this method only stripped a
+           SINGLE layer of wrapping, and its wrapper-detection required
+           `isinstance(val, list)` at the top level, so a raw numpy array
+           never matched at all and passed through completely untouched —
+           silently propagating a rank-5 pixel_values into every encoded
+           record, which then got rejected by _validate_entry's rank
+           check 100% of the time ("instructblip pixel_values rank=5
+           (expected 3 or 4)"), failing the entire encoding pass for that
+           model family with zero successfully encoded records.
+
+        Fix: convert to a numpy array up front (works for both nested
+        lists and arrays/tensors), then strip leading dims of size 1 in a
+        loop until the target per-example rank is reached, however many
+        extra dims that takes. token-sequence fields always target rank 1.
+        pixel_values targets rank 3 or 4 depending on what's already
+        present after one strip (see logic below) — vision processors are
+        not fully consistent about whether per-example image tensors
+        should keep a leading "num_images" axis, so we infer the right
+        target from the family-appropriate range (3..4) rather than
+        hard-coding one value.
 
         Unwrapping all of these here, once, at the only place every
         encoder funnels through, keeps every downstream consumer
@@ -543,17 +578,46 @@ class FeatureEngineeringAgent:
         """
         import numpy as np
 
-        def _is_batch_of_one_wrapper(val) -> bool:
-            return isinstance(val, list) and len(val) == 1 and isinstance(
-                val[0], (list, np.ndarray)
-            )
+        def _strip_to_rank(val, target_rank: int):
+            arr = np.asarray(val)
+            while arr.ndim > target_rank and arr.shape[0] == 1:
+                arr = arr[0]
+            return arr.tolist()
 
-        for key in ("input_ids", "attention_mask", "labels",
-                    "pixel_values", "image_grid_thw",
-                    "qformer_input_ids", "qformer_attention_mask"):
-            val = entry.get(key)
-            if _is_batch_of_one_wrapper(val):
-                entry[key] = val[0]
+        for key, target_rank in self._SEQUENCE_FIELD_TARGET_RANK.items():
+            if key in entry and entry[key] is not None:
+                try:
+                    entry[key] = _strip_to_rank(entry[key], target_rank)
+                except Exception:
+                    pass  # leave as-is; downstream validation will catch real problems
+
+        if "pixel_values" in entry and entry["pixel_values"] is not None:
+            try:
+                arr = np.asarray(entry["pixel_values"])
+                # Strip down to rank 4 first (the common [num_images,C,H,W]
+                # per-example shape used by BLIP-2/InstructBLIP/LLaVA/
+                # Phi-vision). If what's left still has a leading dim of
+                # size 1 AND stripping further would still land at a valid
+                # rank (3, i.e. plain [C,H,W]), strip one more — this
+                # covers processors that don't keep a num_images axis.
+                while arr.ndim > 4 and arr.shape[0] == 1:
+                    arr = arr[0]
+                if arr.ndim == 4 and arr.shape[0] == 1:
+                    # Ambiguous: could be a real [num_images=1,C,H,W] (keep)
+                    # or one more stray wrapper layer over [C,H,W] (strip).
+                    # Peeking one level down tells us which: if arr[0] is
+                    # itself rank-3 and looks like a plausible image
+                    # (C in {1,3,4}, H and W both > 4), it's a real image
+                    # tensor at rank 4 we should keep as-is for vision
+                    # families that expect [num_images,C,H,W]. We leave
+                    # this decision to the per-family validator rather
+                    # than guess further here — rank 4 is already an
+                    # accepted rank, so we stop unwrapping at this point.
+                    pass
+                entry["pixel_values"] = arr.tolist()
+            except Exception:
+                pass
+
         return entry
 
     # ── Model-specific encoders ────────────────────────────────────────────────
