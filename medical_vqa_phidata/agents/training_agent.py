@@ -454,10 +454,21 @@ class TrainingAgent:
             import torch
             sample = train_ds[0]
             ids = torch.as_tensor(sample["input_ids"])
-            if ids.dim() != 1:
+            if ids.dim() == 2 and ids.shape[0] == 1:
+                # Recoverable: a stray batch-of-one leading dim. TrainingAgent's
+                # Qwen-VL collator (and the general column-prep squeeze) strip
+                # this before stacking, so it's not fatal — just log it.
+                logger.warning(
+                    "[Training] input_ids has a leading singleton dim "
+                    f"{tuple(ids.shape)} — will be squeezed before training. "
+                    "If this persists, fix FeatureEngineeringAgent's encoder "
+                    "to save flat per-example sequences."
+                )
+            elif ids.dim() != 1:
                 return (
                     f"Schema validation failed: per-example input_ids rank "
-                    f"{ids.dim()} (expected 1) — tensor_dim_mismatch."
+                    f"{ids.dim()} (shape={tuple(ids.shape)}, expected rank 1) "
+                    f"— tensor_dim_mismatch."
                 )
         except Exception:
             pass
@@ -701,6 +712,16 @@ class TrainingAgent:
             train_ds = train_ds.map(lambda x: {"labels": x["input_ids"]}, batched=True)
             val_ds   = val_ds.map(lambda x: {"labels": x["input_ids"]}, batched=True)
 
+        # Squeeze a stray leading batch-of-one dim off sequence fields for
+        # EVERY model family, not just Qwen-VL. Some HF processors return
+        # [[ids...]] (batch-of-one) instead of [ids...] for a single example
+        # even with return_tensors=None; if that nested shape ever slips
+        # past FeatureEngineeringAgent's own flattening (e.g. an older
+        # cached feature set), torch.stack() during collation would produce
+        # a 3D tensor here too, not just for Qwen-VL.
+        train_ds = self._squeeze_sequence_columns(train_ds)
+        val_ds   = self._squeeze_sequence_columns(val_ds)
+
         is_qwen_vl = self._is_qwen_vl(hf_id)
 
         if "pixel_values" in train_ds.column_names:
@@ -717,6 +738,33 @@ class TrainingAgent:
 
         logger.info(f"[Training] Final columns: {train_ds.column_names}")
         return train_ds, val_ds
+
+    def _squeeze_sequence_columns(self, ds):
+        """Flatten a stray [[ids...]] batch-of-one wrapping to [ids...] for
+        input_ids / attention_mask / labels, if present."""
+        import torch
+
+        def _needs_squeeze(col: str) -> bool:
+            if col not in ds.column_names or len(ds) == 0:
+                return False
+            sample = ds[0][col]
+            t = torch.as_tensor(sample)
+            return t.dim() == 2 and t.shape[0] == 1
+
+        cols_to_fix = [c for c in ("input_ids", "attention_mask", "labels") if _needs_squeeze(c)]
+        if not cols_to_fix:
+            return ds
+
+        logger.info(f"[Training] Squeezing leading singleton dim on columns: {cols_to_fix}")
+
+        def _squeeze_batch(batch):
+            out = {}
+            for c in cols_to_fix:
+                out[c] = [row[0] if isinstance(row, list) and len(row) == 1 and isinstance(row[0], list) else row
+                          for row in batch[c]]
+            return out
+
+        return ds.map(_squeeze_batch, batched=True)
 
     def _normalize_pixel_values(self, train_ds, val_ds, column: str = "pixel_values"):
         import torch
