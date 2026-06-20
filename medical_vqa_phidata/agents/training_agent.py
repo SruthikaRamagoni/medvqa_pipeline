@@ -38,10 +38,38 @@ FAILURE CONTRACT — every failed return now always includes:
     }
 
 A canonical failure_reason ("oom" | "load_error" | "tensor_dim_mismatch" |
-"processor_not_supported" | "training_error") is always produced via
-_classify_failure(), in addition to the original free-text message kept
-under "message", so ModelSelectionAgent's family-level exclusion logic
-gets a reliable signal every time.
+"processor_not_supported" | "unmasked_labels" | "training_error") is
+always produced via _classify_failure(), in addition to the original
+free-text message kept under "message", so ModelSelectionAgent's
+family-level exclusion logic gets a reliable signal every time.
+
+LABEL-MASKING FAST-FAIL (this revision)
+-----------------------------------------
+ROOT CAUSE previously found: FeatureEngineeringAgent's vision-chat encoders
+were copying input_ids straight into labels with zero masking, so loss was
+computed over the prompt/image tokens too. The model never learned to
+answer; loss flatlined; every eval metric (BLEU/ROUGE/exact_match/
+medical_accuracy) came back exactly 0.0 after a full ~50-minute training
+run, because nothing caught the problem until evaluation.
+
+That root cause is now fixed at the source in FeatureEngineeringAgent
+(prompt-length-aware masking). This revision adds a defense-in-depth
+fast-fail here too: _validate_schema() now checks, BEFORE loading the
+model or starting training, that labels are not an exact unmasked copy of
+input_ids and are not 100% masked either. If either condition is hit,
+training halts in seconds with a new canonical failure_reason
+("unmasked_labels") instead of silently burning a full training run to
+produce a useless checkpoint with all-zero eval metrics. This also makes
+the self-healing retry loop able to react to this failure mode
+automatically (excluding the model / triggering feature regeneration)
+instead of it being invisible to the retry contract.
+
+The old `_prepare_columns()` fallback that did
+`labels = {"labels": x["input_ids"]}` (the same unmasked-copy bug, for any
+dataset that reached TrainingAgent without a labels column at all) has
+also been removed in favor of failing fast with a clear, actionable error
+— silently fabricating unmasked labels here would just reintroduce the
+exact same bug one layer up.
 """
 
 from phi.agent import Agent
@@ -388,6 +416,8 @@ class TrainingAgent:
         m = (message or "").lower()
         if any(k in m for k in ("out of memory", "cuda error", "oom", "cudaoutofmemory")):
             return "oom"
+        if any(k in m for k in ("unmasked", "labels identical to input_ids", "labels fully masked")):
+            return "unmasked_labels"
         if any(k in m for k in ("number of dimensions", "shape", "unpack", "dimension", "mask")):
             return "tensor_dim_mismatch"
         if any(k in m for k in ("processor", "autoprocessor", "tokenizer load", "unrecognized configuration")):
@@ -428,6 +458,11 @@ class TrainingAgent:
         Validate dataset schema against the model's expected feature
         strategy BEFORE attempting to load the model or build a trainer.
         Returns an empty string if valid, or an error message otherwise.
+
+        Includes a fast-fail check (NEW) for the unmasked-labels bug class:
+        if labels are an exact copy of input_ids, or are 100% masked, this
+        fails immediately instead of letting a full training run complete
+        and silently produce a checkpoint with all-zero eval metrics.
         """
         cols = set(train_ds.column_names)
         strategy = model_plan.get("feature_strategy", "")
@@ -472,6 +507,49 @@ class TrainingAgent:
                 )
         except Exception:
             pass
+
+        # ── Unmasked-labels fast-fail (NEW) ─────────────────────────────────
+        # Check a small sample of examples, not just one — a single example
+        # could coincidentally have its answer span cover (almost) the
+        # whole sequence. Checking several makes a false positive unlikely
+        # while still failing in well under a second.
+        try:
+            n_check = min(10, len(train_ds))
+            all_identical = True
+            all_fully_masked = True
+            for i in range(n_check):
+                row = train_ds[i]
+                ids = list(row["input_ids"])
+                lbl = list(row["labels"])
+                if ids != lbl:
+                    all_identical = False
+                if any(t != -100 for t in lbl):
+                    all_fully_masked = False
+                if not all_identical and not all_fully_masked:
+                    break
+
+            if all_identical:
+                return (
+                    "Schema validation failed: 'labels' are an exact unmasked "
+                    "copy of 'input_ids' for every sampled example — loss "
+                    "would be computed over prompt/image tokens instead of "
+                    "just the answer span, which produces a flat loss curve "
+                    "and near-zero eval metrics (BLEU/ROUGE/exact_match all "
+                    "0.0). This is the unmasked_labels failure — fix label "
+                    "masking in FeatureEngineeringAgent's encoder for this "
+                    "model family before retraining."
+                )
+            if all_fully_masked:
+                return (
+                    "Schema validation failed: 'labels' are entirely -100 "
+                    "(fully masked) for every sampled example — there are no "
+                    "real training targets left, so the model has nothing to "
+                    "learn from. This is the unmasked_labels failure family — "
+                    "check the prompt-length calculation in "
+                    "FeatureEngineeringAgent's encoder for this model family."
+                )
+        except Exception as e:
+            logger.warning(f"[Training] Unmasked-labels fast-fail check skipped: {e}")
 
         return ""
 
@@ -586,24 +664,6 @@ class TrainingAgent:
         }
         class_order = CLASS_MAP.get(loader_hint, CLASS_MAP["auto"])
 
-        # ── Architecture compatibility gate ─────────────────────────────────
-        # ROOT CAUSE FIX: cls.from_pretrained() does NOT validate that the
-        # checkpoint's actual architecture matches the class you call it on.
-        # Calling InstructBlipForConditionalGeneration.from_pretrained() on a
-        # Qwen2.5-VL checkpoint does NOT raise — it silently loads whatever
-        # tensor names happen to coincide and randomly initializes the rest
-        # ("This checkpoint seem corrupted" + dozens of MISSING/UNEXPECTED
-        # keys), producing a nonsense hybrid model that only fails later,
-        # deep in the training loop, with a misleading error
-        # ("forward() missing 1 required positional argument:
-        # 'qformer_input_ids'") that has nothing to do with the real problem.
-        #
-        # Fix: resolve the checkpoint's real `model_type` via AutoConfig
-        # ONCE, then skip any explicit (non-Auto) class whose expected
-        # model_type doesn't match BEFORE ever calling its from_pretrained().
-        # AutoModelFor* classes are exempt from this gate — they resolve the
-        # correct architecture from the config themselves and are safe by
-        # construction.
         EXPLICIT_CLASS_MODEL_TYPES: Dict[str, set] = {
             "InstructBlipForConditionalGeneration": {"instructblip"},
             "Blip2ForConditionalGeneration":          {"blip-2", "blip_2"},
@@ -765,9 +825,15 @@ class TrainingAgent:
         if drop_vl:
             val_ds = val_ds.remove_columns(drop_vl)
 
-        if "labels" not in train_ds.column_names and "input_ids" in train_ds.column_names:
-            train_ds = train_ds.map(lambda x: {"labels": x["input_ids"]}, batched=True)
-            val_ds   = val_ds.map(lambda x: {"labels": x["input_ids"]}, batched=True)
+        # NOTE: a "labels missing -> copy input_ids" fallback used to live
+        # here. It has been removed on purpose: that copy is unmasked by
+        # definition (no prompt/answer boundary is known at this layer),
+        # so it silently reproduced the exact unmasked-labels bug that
+        # caused 0.0 eval metrics. _validate_schema() now requires
+        # 'labels' to already exist (and be properly masked) before
+        # training ever reaches this point — if it's missing, that's a
+        # FeatureEngineeringAgent bug to fix at the source, not something
+        # to paper over here.
 
         # Squeeze a stray leading batch-of-one dim off sequence fields for
         # EVERY model family, not just Qwen-VL. Some HF processors return
