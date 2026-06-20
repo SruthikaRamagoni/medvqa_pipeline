@@ -439,7 +439,7 @@ class FeatureEngineeringAgent:
 
     def _resolve_effective_max_len(
         self, records: List[Dict], processor, model_family: str, max_len: int,
-        sample_size: int = 20,
+        sample_size: int = 8,
     ) -> int:
         """
         For vision-chat families whose processor expands a single image
@@ -457,17 +457,45 @@ class FeatureEngineeringAgent:
         produce variable-length records that break torch.stack() in
         TrainingAgent's collators.
 
-        Samples a handful of records' prompts (not the full dataset, to
-        keep this fast), measures their TRUE un-truncated token length,
-        and returns max(configured max_len, worst-case-sampled-prompt-len
-        + a small answer-token buffer), capped at
-        _QWEN_VL_MAX_LEN_CEILING. Returns max_len unchanged for families
-        that don't have this image-expansion behavior.
+        MEMORY FIX (this revision): a previous version of this probe used
+        sample_size=20 and held each decoded image + the processor's full
+        encoded output (pixel tensors included, since `images=[image]` is
+        passed) alive across the loop with no explicit cleanup, running
+        the SAME full image-processing work that the main encoding loop
+        was about to redo seconds later for all 2244 records. On a
+        CPU-RAM-constrained Kaggle instance (P100 accelerator, system RAM
+        is the bottleneck here, not VRAM) this contributed to an
+        out-of-memory kernel restart immediately after Step 6 started.
+
+        This version: (1) samples far fewer records (8 instead of 20 — a
+        worst-case prompt length estimate doesn't need many samples to be
+        useful), (2) explicitly deletes each image and encoded-output
+        object as soon as it's used, (3) forces a gc.collect() after the
+        loop so freed memory is actually reclaimed before the much larger
+        main encoding loop starts immediately after, and (4) only resizes
+        max_len at all if the configured value is suspiciously small
+        (< 256) for a vision-chat family — skipping the probe entirely
+        for any already-reasonable configured max_len, since most of the
+        memory cost is avoided by simply not running it when it's
+        unnecessary.
         """
         if model_family != "qwen_vl":
             return max_len
         if not hasattr(processor, "apply_chat_template"):
             return max_len
+        if max_len >= 256:
+            # Already a plausible size for an image-chat prompt — skip the
+            # probe pass entirely rather than spend memory/time confirming
+            # what's very likely already fine. _encode_qwen_vl's own
+            # per-record check will still catch and skip any individual
+            # record whose prompt genuinely doesn't fit.
+            logger.info(
+                f"[FeatureEng] qwen_vl: configured max_seq_len={max_len} is "
+                f"already >= 256 — skipping the max_len probe pass."
+            )
+            return max_len
+
+        import gc
 
         min_answer_tokens = 32  # generous buffer so typical short VQA answers always fit
         worst_case = 0
@@ -493,9 +521,20 @@ class FeatureEngineeringAgent:
                 real_tokens = self._unwrap_token_ids(enc["input_ids"])
                 worst_case = max(worst_case, len(real_tokens))
                 checked += 1
+                del enc, real_tokens  # release pixel-value-bearing output promptly
             except Exception as e:
                 logger.debug(f"[FeatureEng] max_len probe skipped a record: {e}")
-                continue
+            finally:
+                # Always release the decoded image, success or failure —
+                # this is the dominant memory cost per iteration.
+                if image is not None:
+                    try:
+                        image.close()
+                    except Exception:
+                        pass
+                del image
+
+        gc.collect()
 
         if checked == 0:
             logger.warning(
@@ -540,6 +579,8 @@ class FeatureEngineeringAgent:
     def _encode_records(
         self, records, processor, tokenizer, model_family, is_vision, architecture, max_len,
     ) -> List[Dict]:
+        import gc
+
         max_len = self._resolve_effective_max_len(records, processor, model_family, max_len)
 
         encoded = []
@@ -548,6 +589,17 @@ class FeatureEngineeringAgent:
         error_samples: List[str] = []   # first few distinct exception messages, surfaced to the caller
         seen_errors: set = set()
 
+        # MEMORY NOTE: each iteration decodes a full PIL image and (for
+        # vision families) runs it through the model's image processor,
+        # which for Qwen-VL in particular can produce sizeable intermediate
+        # arrays per call. Across ~2000+ records with no explicit release,
+        # PIL/numpy buffers can accumulate faster than the GC reclaims them
+        # on a CPU-RAM-constrained host. Explicitly closing/deleting the
+        # image each iteration and periodically forcing a gc.collect()
+        # keeps peak resident memory bounded instead of growing across the
+        # whole pass.
+        GC_EVERY = 200
+
         for i, rec in enumerate(records):
             question = rec.get("question", "").strip()
             answer   = rec.get("answer",   "").strip()
@@ -555,6 +607,11 @@ class FeatureEngineeringAgent:
 
             if not question or not answer:
                 skipped += 1
+                if image is not None:
+                    try:
+                        image.close()
+                    except Exception:
+                        pass
                 continue
 
             if is_vision and image is None:
@@ -590,7 +647,17 @@ class FeatureEngineeringAgent:
                 logger.warning(f"[FeatureEng] Record {i} encoding failed: {msg}")
                 skipped += 1
                 continue
+            finally:
+                if image is not None:
+                    try:
+                        image.close()
+                    except Exception:
+                        pass
+                del image
+                if (i + 1) % GC_EVERY == 0:
+                    gc.collect()
 
+        gc.collect()
         logger.info(f"[FeatureEng] Encoded {len(encoded)} records. Skipped {skipped}.")
         if no_image_count:
             sample_keys = list(records[0].keys()) if records else []
