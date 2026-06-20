@@ -152,7 +152,17 @@ class FeatureEngineeringAgent:
             model_family, is_vision, architecture, max_len,
         )
         if not encoded:
-            return self._fail("Encoding produced no valid records.")
+            diag = getattr(self, "_last_encode_diagnostics", {})
+            detail = ""
+            if diag.get("no_image_count"):
+                detail = (
+                    f" {diag['no_image_count']}/{diag.get('total_records', 0)} records had "
+                    f"no usable image — check DataPreprocessingAgent's output schema "
+                    f"('image_path' or 'image' field)."
+                )
+            elif diag.get("error_samples"):
+                detail = f" Sample errors: {diag['error_samples']}"
+            return self._fail(f"Encoding produced no valid records.{detail}")
 
         train_ds, val_ds = self._build_hf_datasets(encoded)
 
@@ -307,16 +317,32 @@ class FeatureEngineeringAgent:
     ) -> List[Dict]:
         encoded = []
         skipped = 0
+        no_image_count = 0
+        error_samples: List[str] = []   # first few distinct exception messages, surfaced to the caller
+        seen_errors: set = set()
+
         for i, rec in enumerate(records):
-            question   = rec.get("question", "").strip()
-            answer     = rec.get("answer",   "").strip()
-            image_path = rec.get("image_path", "")
+            question = rec.get("question", "").strip()
+            answer   = rec.get("answer",   "").strip()
+            image    = self._resolve_record_image(rec)
+
             if not question or not answer:
                 skipped += 1
                 continue
+
+            if is_vision and image is None:
+                # A vision model with no usable image for this record is not
+                # a recoverable case (most VLM processors require `images=`
+                # and will raise if called without one) — skip explicitly
+                # instead of falling through to a text-only encode path that
+                # silently crashes for every record.
+                no_image_count += 1
+                skipped += 1
+                continue
+
             try:
                 entry = self._encode_single(
-                    question, answer, image_path, processor, tokenizer,
+                    question, answer, image, processor, tokenizer,
                     model_family, architecture, max_len,
                 )
                 if entry and self._validate_entry(entry, model_family):
@@ -324,10 +350,31 @@ class FeatureEngineeringAgent:
                 else:
                     skipped += 1
             except Exception as e:
-                logger.debug(f"[FeatureEng] Record {i} encoding failed: {e}")
+                msg = f"{type(e).__name__}: {e}"
+                if msg not in seen_errors and len(error_samples) < 5:
+                    seen_errors.add(msg)
+                    error_samples.append(msg)
+                # Surfaced at WARNING (not DEBUG) so it is visible at default
+                # INFO log level instead of being silently swallowed.
+                logger.warning(f"[FeatureEng] Record {i} encoding failed: {msg}")
                 skipped += 1
                 continue
+
         logger.info(f"[FeatureEng] Encoded {len(encoded)} records. Skipped {skipped}.")
+        if no_image_count:
+            logger.warning(
+                f"[FeatureEng] {no_image_count}/{len(records)} records had no "
+                f"usable image for a vision model (model_family={model_family}). "
+                f"Check that DataPreprocessingAgent is populating 'image_path' "
+                f"or 'image' (PIL/bytes) on each record."
+            )
+        if error_samples:
+            logger.warning(f"[FeatureEng] Sample encoding errors: {error_samples}")
+        self._last_encode_diagnostics = {
+            "no_image_count": no_image_count,
+            "error_samples": error_samples,
+            "total_records": len(records),
+        }
         return encoded
 
     def _validate_entry(self, entry: Dict, model_family: str) -> bool:
@@ -354,21 +401,21 @@ class FeatureEngineeringAgent:
         return True
 
     def _encode_single(
-        self, question, answer, image_path, processor, tokenizer,
+        self, question, answer, image, processor, tokenizer,
         model_family, architecture, max_len,
     ) -> Optional[Dict]:
         if model_family in ("flan_t5", "seq2seq"):
             return self._encode_seq2seq(question, answer, tokenizer, max_len)
         if model_family == "blip2":
-            return self._encode_blip2(question, answer, image_path, processor, max_len)
+            return self._encode_blip2(question, answer, image, processor, max_len)
         if model_family == "instructblip":
-            return self._encode_instructblip(question, answer, image_path, processor, max_len)
+            return self._encode_instructblip(question, answer, image, processor, max_len)
         if model_family == "llava":
-            return self._encode_llava(question, answer, image_path, processor, max_len)
+            return self._encode_llava(question, answer, image, processor, max_len)
         if model_family == "qwen_vl":
-            return self._encode_qwen_vl(question, answer, image_path, processor, max_len)
+            return self._encode_qwen_vl(question, answer, image, processor, max_len)
         if model_family == "phi_vision":
-            return self._encode_phi_vision(question, answer, image_path, processor, max_len)
+            return self._encode_phi_vision(question, answer, image, processor, max_len)
         return self._encode_causal(question, answer, tokenizer, max_len)
 
     # ── Model-specific encoders (unchanged behaviour) ─────────────────────────
@@ -383,9 +430,8 @@ class FeatureEngineeringAgent:
         labels = [t if t != tokenizer.pad_token_id else -100 for t in tgt["input_ids"]]
         return {"input_ids": inp["input_ids"], "attention_mask": inp["attention_mask"], "labels": labels}
 
-    def _encode_blip2(self, question, answer, image_path, processor, max_len) -> Dict:
+    def _encode_blip2(self, question, answer, image, processor, max_len) -> Dict:
         prompt = f"Question: {question} Answer:"
-        image  = self._load_image(image_path)
         if image is not None:
             enc = processor(images=image, text=prompt, return_tensors=None,
                              padding="max_length", truncation=True, max_length=max_len)
@@ -399,8 +445,7 @@ class FeatureEngineeringAgent:
         result["labels"] = labels
         return result
 
-    def _encode_instructblip(self, question, answer, image_path, processor, max_len) -> Dict:
-        image = self._load_image(image_path)
+    def _encode_instructblip(self, question, answer, image, processor, max_len) -> Dict:
         prompt = f"Question: {question}\nAnswer:"
         if image is not None:
             enc = processor(images=image, text=prompt, return_tensors=None,
@@ -415,8 +460,7 @@ class FeatureEngineeringAgent:
         result["labels"] = labels
         return result
 
-    def _encode_llava(self, question, answer, image_path, processor, max_len) -> Dict:
-        image  = self._load_image(image_path)
+    def _encode_llava(self, question, answer, image, processor, max_len) -> Dict:
         prompt = f"USER: <image>\n{question}\nASSISTANT: {answer}"
         if image is not None:
             enc = processor(text=prompt, images=image, return_tensors=None,
@@ -429,8 +473,7 @@ class FeatureEngineeringAgent:
         result["labels"] = result.get("input_ids", [])[:]
         return result
 
-    def _encode_qwen_vl(self, question, answer, image_path, processor, max_len) -> Dict:
-        image = self._load_image(image_path)
+    def _encode_qwen_vl(self, question, answer, image, processor, max_len) -> Dict:
         if image is not None and hasattr(processor, "apply_chat_template"):
             messages = [{"role": "user", "content": [
                 {"type": "image"}, {"type": "text", "text": question},
@@ -448,8 +491,7 @@ class FeatureEngineeringAgent:
         result["labels"] = result.get("input_ids", [])[:]
         return result
 
-    def _encode_phi_vision(self, question, answer, image_path, processor, max_len) -> Dict:
-        image = self._load_image(image_path)
+    def _encode_phi_vision(self, question, answer, image, processor, max_len) -> Dict:
         if image is not None:
             prompt = f"<|user|>\n<|image_1|>\n{question}<|end|>\n<|assistant|>\n{answer}<|end|>"
             enc = processor(text=prompt, images=[image], return_tensors=None,
@@ -482,6 +524,56 @@ class FeatureEngineeringAgent:
         except Exception as e:
             logger.debug(f"[FeatureEng] Image load failed {image_path}: {e}")
             return None
+
+    def _resolve_record_image(self, rec: Dict[str, Any]):
+        """
+        Resolve a usable PIL.Image from a processed record, regardless of
+        how DataPreprocessingAgent represented it. This is the fix for the
+        "0 encoded / N skipped" failure: HF image datasets (e.g.
+        flaviagiammarino/vqa-rad) commonly carry the image as an embedded
+        PIL object, raw bytes, or a {"bytes":..., "path":...} dict rather
+        than a filesystem path string in 'image_path' — the old code only
+        ever checked 'image_path', so every record silently fell through
+        to a no-image encode path that crashes for processors (like
+        InstructBLIP's) that require `images=` to be set.
+
+        Tries, in order:
+          1. rec['image_path']      — filesystem path (original behaviour)
+          2. rec['image']           — PIL.Image, raw bytes, numpy array, or
+                                       a HF datasets-style {"bytes","path"} dict
+        Returns a PIL.Image in RGB mode, or None if nothing usable is found.
+        """
+        from PIL import Image
+        import io
+
+        image_path = rec.get("image_path", "")
+        if image_path:
+            img = self._load_image(image_path)
+            if img is not None:
+                return img
+
+        raw = rec.get("image")
+        if raw is None:
+            return None
+
+        try:
+            if isinstance(raw, Image.Image):
+                return raw.convert("RGB")
+            if isinstance(raw, dict):
+                if raw.get("bytes"):
+                    return Image.open(io.BytesIO(raw["bytes"])).convert("RGB")
+                if raw.get("path"):
+                    return self._load_image(raw["path"])
+                return None
+            if isinstance(raw, (bytes, bytearray)):
+                return Image.open(io.BytesIO(raw)).convert("RGB")
+            # numpy array or similar array-like
+            import numpy as np
+            if isinstance(raw, np.ndarray):
+                return Image.fromarray(raw).convert("RGB")
+        except Exception as e:
+            logger.debug(f"[FeatureEng] Could not resolve embedded image: {e}")
+        return None
 
     # ── HuggingFace Dataset / cache persistence ────────────────────────────────
 
