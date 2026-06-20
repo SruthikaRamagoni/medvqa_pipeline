@@ -2,15 +2,31 @@
 agents/modality_discovery_agent.py
 
 ModalityDiscoveryAgent — detects medical imaging modality from image + question.
-Uses PhiData Agent with Groq LLM (llama-3.1-8b-instant).
+Uses PhiData Agent with Groq LLM (vision-capable model for the fallback path).
 Same structure as reference code.
 
-Fixes:
-  - Removed PythonTools (caused Groq 400 tool_use_failed loop)
-  - Heuristic now covers pneumonia, infection, consolidation → X-Ray
-  - Groq prompt is short and direct (no multi-line JSON blocks that confuse LLM)
-  - Heuristic result is used directly when confidence >= 0.3 (no LLM needed)
-  - LLM called only for low-confidence ambiguous cases
+Fixes (this revision):
+  - [BUG FIX] is_grayscale now inspects actual per-pixel channel equality for
+    RGB-mode images instead of trusting PIL `mode`. Medical images are almost
+    always saved as 3-channel RGB even though every pixel is R=G=B, so the old
+    `img.mode in ("L","1","LA")` check was False for nearly all real inputs —
+    silently disabling the entire pixel-based heuristic.
+  - [BUG FIX] CT and MRI no longer receive an identical score bonus for the
+    same pixel-brightness bucket. The old tie was always broken by Python
+    dict-iteration order, which silently favored CT for every ambiguous
+    grayscale image (including MRIs and borderline X-rays). Added an
+    edge-sharpness feature (bone/skeletal high-contrast edges are far more
+    prominent in X-Ray/CT than in MRI) to separate the two instead of a
+    pure tie, and ties that remain return "Unknown" rather than an arbitrary
+    pick.
+  - [BUG FIX] LLM fallback is now actually multimodal — the image is attached
+    to the Groq agent call (vision-capable model) instead of asking a
+    text-only model to guess modality from a few numbers (which had also
+    been silently fed the wrong is_grayscale value).
+  - Heuristic still covers pneumonia, infection, consolidation → X-Ray.
+  - Groq prompt is short and direct (no multi-line JSON blocks that confuse LLM).
+  - Heuristic result is used directly when confidence >= 0.3 (no LLM needed).
+  - LLM called only for low-confidence ambiguous cases.
 """
 
 from phi.agent import Agent
@@ -69,6 +85,10 @@ MODALITY_KEYWORDS: Dict[str, list] = {
     ],
 }
 
+# Vision-capable Groq model for the multimodal fallback path.
+# (llama-3.1-8b-instant is text-only and cannot see the image.)
+VISION_MODEL_ID = "llama-3.2-11b-vision-preview"
+
 
 class ModalityDiscoveryAgent:
     """
@@ -76,19 +96,23 @@ class ModalityDiscoveryAgent:
     from the input image pixel statistics and question text.
 
     Strategy:
-      1. Extract image pixel stats (grayscale, mean, channels).
+      1. Extract image pixel stats (true grayscale check, mean, edge sharpness).
       2. Run keyword + pixel heuristic → fast, no API call.
       3. If heuristic confidence >= 0.3 → use heuristic directly.
-      4. If confidence < 0.3 → ask Groq LLM for final decision.
+      4. If confidence < 0.3 → ask a vision-capable Groq LLM, passing the
+         actual image, for a final decision.
     """
 
-    def __init__(self, model_id: str = "mistral"):
+    def __init__(self, model_id: str = VISION_MODEL_ID):
         self.agent = Agent(
             name="ModalityDiscoveryAgent",
-            model=Groq(id="llama-3.1-8b-instant"),
+            model=Groq(id=model_id),
             instructions=[
                 "You are a medical imaging expert.",
-                "Given image statistics and a clinical question, identify the imaging modality.",
+                "You will be shown a medical image plus a clinical question.",
+                "Look at the actual image content (texture, contrast, cross-sectional "
+                "vs. projection geometry, bone brightness, soft-tissue detail) to decide "
+                "the imaging modality. Do not just guess from the question text.",
                 "Choose ONLY from: X-Ray, CT, MRI, Pathology, Fundus, Ultrasound, Dermoscopy, Endoscopy, Unknown.",
                 "Reply with ONLY a JSON object like: {\"modality\": \"X-Ray\", \"confidence\": 0.9}",
                 "Do not add any explanation or text outside the JSON.",
@@ -124,14 +148,17 @@ class ModalityDiscoveryAgent:
             logger.info(f"[Modality] High confidence heuristic — skipping LLM call.")
             return {"modality": heuristic, "confidence": round(conf, 2)}
 
-        # Step 4: low confidence → ask Groq LLM
-        logger.info(f"[Modality] Low confidence — asking Groq LLM.")
-        return self._ask_llm(stats, question, heuristic, conf)
+        # Step 4: low confidence → ask Groq vision LLM, with the actual image
+        logger.info(f"[Modality] Low confidence — asking Groq vision LLM.")
+        return self._ask_llm(image_path, stats, question, heuristic, conf)
 
     # ── Image stats ───────────────────────────────────────────────────────────
 
     def _get_image_stats(self, image_path: str) -> Dict[str, Any]:
-        """Extract basic pixel statistics from the image."""
+        """Extract pixel statistics from the image, including a *real*
+        grayscale check (per-pixel channel equality) and a simple edge-
+        sharpness feature used to separate X-Ray/CT (high-contrast bone
+        edges) from MRI (smoother soft-tissue contrast)."""
         if not image_path or not Path(image_path).exists():
             return {
                 "found": False,
@@ -140,26 +167,53 @@ class ModalityDiscoveryAgent:
                 "channels": 3,
                 "width": 0,
                 "height": 0,
+                "edge_strength": 0.0,
             }
         try:
             from PIL import Image
             import numpy as np
 
-            img  = Image.open(image_path)
-            arr  = np.array(img)
+            img = Image.open(image_path)
+            arr = np.array(img)
+
+            # --- Real grayscale detection -------------------------------------
+            # PIL `mode` reflects file color space, not visual content. Medical
+            # images are very commonly stored as 3-channel RGB with R=G=B per
+            # pixel. Detect that case explicitly instead of trusting `mode`.
+            if img.mode in ("L", "1", "LA"):
+                is_grayscale = True
+            elif img.mode == "RGB" and arr.ndim == 3 and arr.shape[-1] == 3:
+                # Allow small JPEG-compression tolerance between channels.
+                diff_rg = np.abs(arr[..., 0].astype(int) - arr[..., 1].astype(int))
+                diff_gb = np.abs(arr[..., 1].astype(int) - arr[..., 2].astype(int))
+                is_grayscale = bool(diff_rg.mean() < 2.0 and diff_gb.mean() < 2.0)
+            else:
+                is_grayscale = False
+
+            # --- Edge-sharpness feature ----------------------------------------
+            # Crude but cheap: mean absolute gradient on a single luminance
+            # channel. X-Ray/CT typically show sharp, high-contrast bone edges;
+            # MRI soft tissue contrast is comparatively smooth. This is used
+            # only as a tie-breaker, not a definitive classifier.
+            gray = arr.mean(axis=-1) if arr.ndim == 3 else arr.astype(float)
+            gx = np.abs(np.diff(gray, axis=1)).mean() if gray.shape[1] > 1 else 0.0
+            gy = np.abs(np.diff(gray, axis=0)).mean() if gray.shape[0] > 1 else 0.0
+            edge_strength = round(float((gx + gy) / 2), 2)
+
             return {
-                "found":       True,
-                "width":       img.width,
-                "height":      img.height,
-                "mode":        img.mode,
-                "channels":    len(img.getbands()),
-                "mean_pixel":  round(float(arr.mean()), 2),
-                "std_pixel":   round(float(arr.std()),  2),
-                "is_grayscale":img.mode in ("L", "1", "LA"),
+                "found":        True,
+                "width":        img.width,
+                "height":       img.height,
+                "mode":         img.mode,
+                "channels":     len(img.getbands()),
+                "mean_pixel":   round(float(arr.mean()), 2),
+                "std_pixel":    round(float(arr.std()),  2),
+                "is_grayscale": is_grayscale,
+                "edge_strength": edge_strength,
             }
         except Exception as e:
             logger.warning(f"[Modality] Image stats error: {e}")
-            return {"found": False, "is_grayscale": False, "mean_pixel": 128}
+            return {"found": False, "is_grayscale": False, "mean_pixel": 128, "edge_strength": 0.0}
 
     # ── Heuristic ─────────────────────────────────────────────────────────────
 
@@ -181,67 +235,97 @@ class ModalityDiscoveryAgent:
                     scores[modality] += 0.25
 
         # Pixel statistics boost
-        is_gray   = stats.get("is_grayscale", False)
-        mean_px   = stats.get("mean_pixel",   128)
-        channels  = stats.get("channels",     3)
+        is_gray       = stats.get("is_grayscale", False)
+        mean_px       = stats.get("mean_pixel",   128)
+        edge_strength = stats.get("edge_strength", 0.0)
 
         # Grayscale + dark background → very likely X-Ray
         if is_gray and mean_px < 100:
             scores["X-Ray"] += 0.30
 
-        # Grayscale + medium brightness → could be CT or MRI
+        # Grayscale + medium brightness → CT or MRI; use edge sharpness to
+        # split the tie instead of awarding both the same bonus.
         if is_gray and 80 <= mean_px <= 180:
-            scores["CT"]  += 0.10
-            scores["MRI"] += 0.10
+            # Higher edge_strength → sharper high-contrast structures (bone,
+            # CT slice boundaries) → favor CT. Lower → smoother soft-tissue
+            # contrast typical of MRI.
+            if edge_strength >= 12.0:
+                scores["CT"] += 0.22
+                scores["MRI"] += 0.08
+            elif edge_strength <= 6.0:
+                scores["MRI"] += 0.22
+                scores["CT"] += 0.08
+            else:
+                # Genuinely ambiguous on pixels alone — small, equal nudge.
+                # Combined with keyword scoring this rarely ends in an exact
+                # tie; if it still does, _heuristic_modality below returns
+                # "Unknown" rather than silently picking one.
+                scores["CT"] += 0.10
+                scores["MRI"] += 0.10
 
         # Colour image → likely Pathology, Fundus, or Dermoscopy
-        if not is_gray and channels == 3:
+        if not is_gray and stats.get("channels", 3) == 3:
             scores["Pathology"]  += 0.05
             scores["Fundus"]     += 0.05
             scores["Dermoscopy"] += 0.05
 
-        # Pick best
-        best = max(scores, key=scores.get)
-        conf = min(scores[best], 1.0)
+        # Pick best, but detect unresolved ties among the top score instead
+        # of silently relying on dict iteration order (which previously
+        # always favored "CT" over "MRI" on exact ties).
+        best_val = max(scores.values())
+        top = [m for m, v in scores.items() if v == best_val]
 
-        if conf < 0.1:
+        if best_val < 0.1:
             return "Unknown", 0.0
 
+        if len(top) > 1:
+            logger.info(f"[Modality] Heuristic tie among {top} at {best_val:.2f} — treating as low confidence.")
+            return "Unknown", 0.0
+
+        best = top[0]
+        conf = min(best_val, 1.0)
         return best, conf
 
     # ── LLM call ─────────────────────────────────────────────────────────────
 
     def _ask_llm(
         self,
+        image_path: str,
         stats: Dict,
         question: str,
         heuristic: str,
         heuristic_conf: float,
     ) -> Dict[str, Any]:
         """
-        Ask Groq LLM to determine modality when heuristic is not confident.
-        Keeps the prompt short and direct to avoid Groq 400 errors.
+        Ask a vision-capable Groq LLM to determine modality when the heuristic
+        is not confident. The image itself is attached so the model is
+        actually looking at pixel content, not guessing from a text summary.
         """
-        # Build a short, clean stats string (no nested JSON to confuse LLM)
         stats_line = (
             f"grayscale={stats.get('is_grayscale', False)}, "
             f"mean_pixel={stats.get('mean_pixel', 128)}, "
+            f"edge_strength={stats.get('edge_strength', 0.0)}, "
             f"channels={stats.get('channels', 3)}, "
             f"size={stats.get('width', 0)}x{stats.get('height', 0)}"
         )
 
         prompt = (
             f"Medical imaging modality detection task.\n\n"
-            f"Image stats: {stats_line}\n"
+            f"Image stats (for reference only — look at the attached image itself "
+            f"as the primary evidence): {stats_line}\n"
             f"Clinical question: {question}\n"
-            f"Preliminary guess: {heuristic} (confidence {heuristic_conf:.2f})\n\n"
+            f"Preliminary heuristic guess: {heuristic} (confidence {heuristic_conf:.2f})\n\n"
             f"What is the most likely medical imaging modality?\n"
             f"Choose one: X-Ray, CT, MRI, Pathology, Fundus, Ultrasound, Dermoscopy, Endoscopy, Unknown\n\n"
             f'Reply with ONLY this JSON: {{"modality": "<name>", "confidence": <0.0-1.0>}}'
         )
 
         try:
-            response = self.agent.run(prompt)
+            if image_path and Path(image_path).exists():
+                # phi Agent.run supports passing images for vision-capable models.
+                response = self.agent.run(prompt, images=[image_path])
+            else:
+                response = self.agent.run(prompt)
             return self._parse_response(response, heuristic, heuristic_conf)
         except Exception as e:
             logger.warning(f"[Modality] LLM call failed: {e}. Using heuristic.")
