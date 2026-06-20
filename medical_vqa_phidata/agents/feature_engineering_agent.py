@@ -20,6 +20,32 @@ after ModelSelectionAgent picks a different model.
 Encoded records are now validated (_validate_entry) before being added to
 the dataset: invalid/missing tensor fields or wrong-rank pixel_values are
 rejected rather than silently propagated to TrainingAgent.
+
+LABEL-MASKING FIX (this revision)
+----------------------------------
+ROOT CAUSE of "training loss flatlines, eval metrics all 0.0":
+_encode_qwen_vl / _encode_llava / _encode_phi_vision previously did
+
+    result["labels"] = result["input_ids"][:]
+
+i.e. labels were an exact, fully-UNMASKED copy of input_ids. Teacher-forced
+LM loss was therefore computed over the ENTIRE sequence — image tokens,
+chat-template scaffolding, and the question — not just the answer span.
+Those non-answer tokens are trivially predictable (they're scaffolding /
+already-seen-in-context tokens), so the loss converges fast to a low
+"free" value within ~1 epoch and then has nowhere left to improve, because
+the answer tokens (the only part that actually matters) are a small
+fraction of total loss and their gradient contribution is diluted away.
+The model never learns to produce real answers, hence exact_match / BLEU /
+ROUGE / medical_accuracy = 0.0 across the board at eval time, even though
+training "looked" like it converged.
+
+FIX: every vision-chat encoder now tokenizes the PROMPT ALONE first (same
+image, no answer) to find exactly how many leading tokens belong to the
+prompt/image/scaffolding. That length is used to mask labels[:prompt_len]
+= -100. Padding tokens are also masked. Only the answer span (+ EOS, if
+present before truncation) remains a real loss target — which is the
+standard, correct recipe for instruction/VQA fine-tuning.
 """
 
 from phi.agent import Agent
@@ -114,6 +140,8 @@ class FeatureEngineeringAgent:
             "feature_strategy":  model_plan.get("feature_strategy", self._default_feature_strategy(model_family)),
             "tensor_schema":     model_plan.get("tensor_schema", ""),
             "image_enabled":     bool(is_vision),
+            # Bumping this whenever the encoding/label-masking recipe
+            "label_masking_version": 2,
         }
 
         feature_path = self._feature_path_for(hf_id, model_family)
@@ -261,7 +289,7 @@ class FeatureEngineeringAgent:
             return False
 
         compare_keys = ["model_hf_id", "architecture", "processor_type",
-                         "feature_strategy", "image_enabled"]
+                         "feature_strategy", "image_enabled", "label_masking_version"]
         for k in compare_keys:
             if existing.get(k) != target_meta.get(k):
                 logger.info(
@@ -309,6 +337,34 @@ class FeatureEngineeringAgent:
             inner.pad_token = inner.eos_token
 
         return processor, tokenizer
+
+    # ── Label masking helper (NEW) ───────────────────────────────────────────
+
+    def _mask_prompt_and_padding(self, input_ids: List[int], prompt_len: int,
+                                  pad_token_id: Optional[int]) -> List[int]:
+        """
+        Build a `labels` list from `input_ids`: mask every token that
+        belongs to the prompt/image/scaffolding portion (index < prompt_len)
+        AND every padding token, with -100 (the value HF's CrossEntropyLoss
+        is configured to ignore). Only the answer span (+ EOS, if not
+        truncated away) survives as a real training target.
+
+        This is what was MISSING before: encoders were doing
+        `labels = input_ids[:]`, training the model to "predict" the
+        prompt it was just given — which is trivial and contributes almost
+        nothing useful, while diluting the gradient on the answer tokens
+        that actually matter. That is the direct cause of loss flatlining
+        early and eval metrics landing at 0.0.
+        """
+        labels = list(input_ids)
+        n = len(labels)
+        capped_prompt_len = min(prompt_len, n)  # truncation guard
+        for i in range(n):
+            if i < capped_prompt_len:
+                labels[i] = -100
+            elif pad_token_id is not None and labels[i] == pad_token_id:
+                labels[i] = -100
+        return labels
 
     # ── Encoding ──────────────────────────────────────────────────────────────
 
@@ -403,6 +459,18 @@ class FeatureEngineeringAgent:
             return "missing labels"
         if not isinstance(entry["input_ids"], list) or len(entry["input_ids"]) == 0:
             return f"input_ids not a non-empty list (got {type(entry['input_ids']).__name__})"
+
+        # Guard against the exact bug this revision fixes: reject any entry
+        # whose labels are identical to input_ids (i.e. completely
+        # unmasked). A real masked entry should differ from input_ids
+        # unless every single token happens to be part of the answer span
+        # (essentially never true once padding/prompt exist).
+        labels = entry["labels"]
+        if isinstance(labels, list) and labels == entry["input_ids"]:
+            return "labels identical to input_ids — masking did not run (would train on prompt/padding tokens)"
+        if isinstance(labels, list) and all(t == -100 for t in labels):
+            return "labels fully masked (-100 everywhere) — no answer tokens survived, nothing to learn from"
+
         if model_family in VISION_FAMILIES:
             if "pixel_values" not in entry:
                 return "vision model but 'pixel_values' missing from encoded entry (processor call likely returned no image tensor)"
@@ -488,7 +556,7 @@ class FeatureEngineeringAgent:
                 entry[key] = val[0]
         return entry
 
-    # ── Model-specific encoders (unchanged behaviour) ─────────────────────────
+    # ── Model-specific encoders ────────────────────────────────────────────────
 
     def _encode_seq2seq(self, question, answer, tokenizer, max_len) -> Dict:
         prompt = f"Medical question: {question}"
@@ -531,34 +599,75 @@ class FeatureEngineeringAgent:
         return result
 
     def _encode_llava(self, question, answer, image, processor, max_len) -> Dict:
-        prompt = f"USER: <image>\n{question}\nASSISTANT: {answer}"
+        """
+        FIXED: previously did `result["labels"] = input_ids[:]` (no
+        masking at all). Now tokenizes the prompt portion alone first to
+        find prompt_len, then masks everything before the answer span
+        (plus padding) to -100.
+        """
+        prompt_text = f"USER: <image>\n{question}\nASSISTANT:"
+        full_text   = f"{prompt_text} {answer}"
+
         if image is not None:
-            enc = processor(text=prompt, images=image, return_tensors=None,
+            prompt_only_enc = processor(text=prompt_text, images=image, return_tensors=None,
+                                         truncation=True, max_length=max_len)
+            prompt_len = len(prompt_only_enc["input_ids"])
+            enc = processor(text=full_text, images=image, return_tensors=None,
                              padding="max_length", truncation=True, max_length=max_len)
+            tok = getattr(processor, "tokenizer", processor)
         else:
             tok = getattr(processor, "tokenizer", processor)
-            enc = tok(prompt, return_tensors=None, padding="max_length",
+            prompt_only_enc = tok(prompt_text, return_tensors=None, truncation=True, max_length=max_len)
+            prompt_len = len(prompt_only_enc["input_ids"])
+            enc = tok(full_text, return_tensors=None, padding="max_length",
                       truncation=True, max_length=max_len)
+
         result = {k: v for k, v in enc.items()}
-        result["labels"] = result.get("input_ids", [])[:]
+        pad_id = getattr(tok, "pad_token_id", None)
+        result["labels"] = self._mask_prompt_and_padding(result["input_ids"], prompt_len, pad_id)
         return result
 
     def _encode_qwen_vl(self, question, answer, image, processor, max_len) -> Dict:
+        """
+        FIXED: previously did `result["labels"] = input_ids[:]` (no
+        masking at all) — this was the primary cause of 0.0 eval metrics.
+        Now tokenizes the chat-template prompt alone (no answer appended)
+        to find exactly how many leading tokens are prompt/image/
+        scaffolding, then masks labels[:prompt_len] = -100 plus all
+        padding tokens. Only the answer span remains a real loss target.
+        """
+        tok = getattr(processor, "tokenizer", processor)
+
         if image is not None and hasattr(processor, "apply_chat_template"):
             messages = [{"role": "user", "content": [
                 {"type": "image"}, {"type": "text", "text": question},
             ]}]
-            text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            text += answer
-            enc = processor(text=text, images=[image], return_tensors=None,
+            prompt_text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+            full_text = prompt_text + answer
+
+            # Tokenize prompt alone (same image, no answer) purely to
+            # measure its token length — this defines the mask boundary.
+            prompt_only_enc = processor(text=prompt_text, images=[image],
+                                         return_tensors=None, truncation=True,
+                                         max_length=max_len)
+            prompt_len = len(prompt_only_enc["input_ids"])
+
+            enc = processor(text=full_text, images=[image], return_tensors=None,
                              padding="max_length", truncation=True, max_length=max_len)
         else:
-            tok  = getattr(processor, "tokenizer", processor)
-            text = f"Question: {question}\nAnswer: {answer}"
-            enc  = tok(text, return_tensors=None, padding="max_length",
-                       truncation=True, max_length=max_len)
+            prompt_text = f"Question: {question}\nAnswer:"
+            prompt_only_enc = tok(prompt_text, return_tensors=None, truncation=True, max_length=max_len)
+            prompt_len = len(prompt_only_enc["input_ids"])
+
+            full_text = f"{prompt_text} {answer}"
+            enc = tok(full_text, return_tensors=None, padding="max_length",
+                      truncation=True, max_length=max_len)
+
         result = {k: v for k, v in enc.items()}
-        result["labels"] = result.get("input_ids", [])[:]
+        pad_id = getattr(tok, "pad_token_id", None)
+        result["labels"] = self._mask_prompt_and_padding(result["input_ids"], prompt_len, pad_id)
+
         if "image_grid_thw" in result:
             g = result["image_grid_thw"]
             # Some processor versions wrap this as [[t,h,w]] (batch-of-one)
@@ -570,17 +679,33 @@ class FeatureEngineeringAgent:
         return result
 
     def _encode_phi_vision(self, question, answer, image, processor, max_len) -> Dict:
+        """
+        FIXED: previously did `result["labels"] = input_ids[:]` (no
+        masking at all). Now tokenizes the prompt portion alone first to
+        find prompt_len, then masks everything before the answer span
+        (plus padding) to -100.
+        """
         if image is not None:
-            prompt = f"<|user|>\n<|image_1|>\n{question}<|end|>\n<|assistant|>\n{answer}<|end|>"
-            enc = processor(text=prompt, images=[image], return_tensors=None,
+            prompt_text = f"<|user|>\n<|image_1|>\n{question}<|end|>\n<|assistant|>\n"
+            full_text   = f"{prompt_text}{answer}<|end|>"
+            prompt_only_enc = processor(text=prompt_text, images=[image], return_tensors=None,
+                                         truncation=True, max_length=max_len)
+            prompt_len = len(prompt_only_enc["input_ids"])
+            enc = processor(text=full_text, images=[image], return_tensors=None,
                              padding="max_length", truncation=True, max_length=max_len)
+            tok = getattr(processor, "tokenizer", processor)
         else:
-            tok  = getattr(processor, "tokenizer", processor)
-            text = f"<|user|>\n{question}<|end|>\n<|assistant|>\n{answer}<|end|>"
-            enc  = tok(text, return_tensors=None, padding="max_length",
-                       truncation=True, max_length=max_len)
+            tok = getattr(processor, "tokenizer", processor)
+            prompt_text = f"<|user|>\n{question}<|end|>\n<|assistant|>\n"
+            full_text   = f"{prompt_text}{answer}<|end|>"
+            prompt_only_enc = tok(prompt_text, return_tensors=None, truncation=True, max_length=max_len)
+            prompt_len = len(prompt_only_enc["input_ids"])
+            enc = tok(full_text, return_tensors=None, padding="max_length",
+                      truncation=True, max_length=max_len)
+
         result = {k: v for k, v in enc.items()}
-        result["labels"] = result.get("input_ids", [])[:]
+        pad_id = getattr(tok, "pad_token_id", None)
+        result["labels"] = self._mask_prompt_and_padding(result["input_ids"], prompt_len, pad_id)
         return result
 
     def _encode_causal(self, question, answer, tokenizer, max_len) -> Dict:
