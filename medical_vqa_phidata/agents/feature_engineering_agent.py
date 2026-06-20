@@ -46,6 +46,17 @@ prompt/image/scaffolding. That length is used to mask labels[:prompt_len]
 = -100. Padding tokens are also masked. Only the answer span (+ EOS, if
 present before truncation) remains a real loss target — which is the
 standard, correct recipe for instruction/VQA fine-tuning.
+
+PROGRESS LOGGING (this revision)
+----------------------------------
+_encode_records previously had no logging at all inside its main
+per-record loop, so on large datasets (e.g. 2244 records) the only
+visible log lines were the max_len probe result and then — after the
+ENTIRE loop finished, possibly many minutes later, especially on CPU —
+a single summary line. This made a slow-but-healthy run indistinguishable
+from a genuine hang. A periodic progress line (every 100 records, plus
+the final record) is now emitted with running encoded/skipped/no_image
+counts so progress is visible in real time.
 """
 
 from phi.agent import Agent
@@ -363,37 +374,12 @@ class FeatureEngineeringAgent:
         example (with return_tensors=None), return the flat list of real
         token ids — regardless of how many extra batch-of-one wrapper
         layers the processor added around it.
-
-        ROOT CAUSE this fixes: HF processors/tokenizers always treat their
-        input as a batch internally. For a single example with
-        return_tensors=None, this commonly surfaces as input_ids shaped
-        like [[id, id, id, ...]] (or even more nested) instead of a flat
-        [id, id, id, ...]. Calling plain `len(enc["input_ids"])` on that —
-        as a naive length check would — measures the OUTER wrapper's
-        length (almost always 1), not the real token count.
-
-        This exact bug appeared twice independently in this file: once in
-        the original (now-fixed) label-masking code, and again in
-        _resolve_effective_max_len's prompt-length probe, which doesn't go
-        through any encoder-side unwrapping and used a raw `len(...)` —
-        causing the probe to report "worst-case sampled prompt=1 tokens"
-        regardless of the real (e.g. 350+ token) image-expanded prompt
-        length, silently defeating the max_len auto-resize entirely.
-
-        Every call site that needs a token COUNT or the actual token
-        VALUES for a single example should route through this helper
-        rather than indexing/len()-ing the raw processor output directly.
         """
         cur = val
-        # Unwrap any number of length-1 list layers, but stop as soon as
-        # we hit a list whose first element is NOT itself a list (i.e.
-        # we've reached the actual flat token sequence) or stop if it's
-        # already empty / not a list at all.
         while isinstance(cur, list) and len(cur) == 1 and isinstance(cur[0], list):
             cur = cur[0]
         if isinstance(cur, list):
             return cur
-        # Fallback: numpy/torch array or similar — convert defensively.
         try:
             import numpy as np
             arr = np.asarray(cur)
@@ -408,16 +394,7 @@ class FeatureEngineeringAgent:
         """
         Build a `labels` list from `input_ids`: mask every token that
         belongs to the prompt/image/scaffolding portion (index < prompt_len)
-        AND every padding token, with -100 (the value HF's CrossEntropyLoss
-        is configured to ignore). Only the answer span (+ EOS, if not
-        truncated away) survives as a real training target.
-
-        This is what was MISSING before: encoders were doing
-        `labels = input_ids[:]`, training the model to "predict" the
-        prompt it was just given — which is trivial and contributes almost
-        nothing useful, while diluting the gradient on the answer tokens
-        that actually matter. That is the direct cause of loss flatlining
-        early and eval metrics landing at 0.0.
+        AND every padding token, with -100.
         """
         labels = list(input_ids)
         n = len(labels)
@@ -431,64 +408,17 @@ class FeatureEngineeringAgent:
 
     # ── Encoding ──────────────────────────────────────────────────────────────
 
-    # Hard ceiling for the auto-resolved max_len (see _resolve_effective_max_len).
-    # Exists purely as a safety bound against runaway sequence length /
-    # memory use on unusually large images, not because typical medical
-    # images should ever approach it.
     _QWEN_VL_MAX_LEN_CEILING = 2048
 
     def _resolve_effective_max_len(
         self, records: List[Dict], processor, model_family: str, max_len: int,
         sample_size: int = 8,
     ) -> int:
-        """
-        For vision-chat families whose processor expands a single image
-        placeholder into many image-patch tokens internally (currently:
-        qwen_vl), the configured model_plan['max_seq_len'] can be far too
-        small to even fit the prompt, let alone any answer — e.g. 128
-        tokens (a reasonable default for short text-only QA) vs. an
-        actual Qwen2.5-VL image-expanded prompt that can run several
-        hundred tokens or more depending on resolution.
-
-        Called ONCE per dataset, BEFORE the per-record encoding loop —
-        deliberately NOT per-record — because every record in the
-        resulting HF Dataset must share one fixed padded sequence length
-        for batching/collation to work; growing max_len mid-encode would
-        produce variable-length records that break torch.stack() in
-        TrainingAgent's collators.
-
-        MEMORY FIX (this revision): a previous version of this probe used
-        sample_size=20 and held each decoded image + the processor's full
-        encoded output (pixel tensors included, since `images=[image]` is
-        passed) alive across the loop with no explicit cleanup, running
-        the SAME full image-processing work that the main encoding loop
-        was about to redo seconds later for all 2244 records. On a
-        CPU-RAM-constrained Kaggle instance (P100 accelerator, system RAM
-        is the bottleneck here, not VRAM) this contributed to an
-        out-of-memory kernel restart immediately after Step 6 started.
-
-        This version: (1) samples far fewer records (8 instead of 20 — a
-        worst-case prompt length estimate doesn't need many samples to be
-        useful), (2) explicitly deletes each image and encoded-output
-        object as soon as it's used, (3) forces a gc.collect() after the
-        loop so freed memory is actually reclaimed before the much larger
-        main encoding loop starts immediately after, and (4) only resizes
-        max_len at all if the configured value is suspiciously small
-        (< 256) for a vision-chat family — skipping the probe entirely
-        for any already-reasonable configured max_len, since most of the
-        memory cost is avoided by simply not running it when it's
-        unnecessary.
-        """
         if model_family != "qwen_vl":
             return max_len
         if not hasattr(processor, "apply_chat_template"):
             return max_len
         if max_len >= 256:
-            # Already a plausible size for an image-chat prompt — skip the
-            # probe pass entirely rather than spend memory/time confirming
-            # what's very likely already fine. _encode_qwen_vl's own
-            # per-record check will still catch and skip any individual
-            # record whose prompt genuinely doesn't fit.
             logger.info(
                 f"[FeatureEng] qwen_vl: configured max_seq_len={max_len} is "
                 f"already >= 256 — skipping the max_len probe pass."
@@ -497,7 +427,7 @@ class FeatureEngineeringAgent:
 
         import gc
 
-        min_answer_tokens = 32  # generous buffer so typical short VQA answers always fit
+        min_answer_tokens = 32
         worst_case = 0
         checked = 0
 
@@ -521,12 +451,10 @@ class FeatureEngineeringAgent:
                 real_tokens = self._unwrap_token_ids(enc["input_ids"])
                 worst_case = max(worst_case, len(real_tokens))
                 checked += 1
-                del enc, real_tokens  # release pixel-value-bearing output promptly
+                del enc, real_tokens
             except Exception as e:
                 logger.debug(f"[FeatureEng] max_len probe skipped a record: {e}")
             finally:
-                # Always release the decoded image, success or failure —
-                # this is the dominant memory cost per iteration.
                 if image is not None:
                     try:
                         image.close()
@@ -579,26 +507,22 @@ class FeatureEngineeringAgent:
     def _encode_records(
         self, records, processor, tokenizer, model_family, is_vision, architecture, max_len,
     ) -> List[Dict]:
-        import gc
+        import gc, time
 
         max_len = self._resolve_effective_max_len(records, processor, model_family, max_len)
 
         encoded = []
         skipped = 0
         no_image_count = 0
-        error_samples: List[str] = []   # first few distinct exception messages, surfaced to the caller
+        error_samples: List[str] = []
         seen_errors: set = set()
 
-        # MEMORY NOTE: each iteration decodes a full PIL image and (for
-        # vision families) runs it through the model's image processor,
-        # which for Qwen-VL in particular can produce sizeable intermediate
-        # arrays per call. Across ~2000+ records with no explicit release,
-        # PIL/numpy buffers can accumulate faster than the GC reclaims them
-        # on a CPU-RAM-constrained host. Explicitly closing/deleting the
-        # image each iteration and periodically forcing a gc.collect()
-        # keeps peak resident memory bounded instead of growing across the
-        # whole pass.
         GC_EVERY = 200
+        PROGRESS_EVERY = 100
+        total = len(records)
+        t_start = time.time()
+
+        logger.info(f"[FeatureEng] Starting encode loop over {total} records …")
 
         for i, rec in enumerate(records):
             question = rec.get("question", "").strip()
@@ -615,11 +539,6 @@ class FeatureEngineeringAgent:
                 continue
 
             if is_vision and image is None:
-                # A vision model with no usable image for this record is not
-                # a recoverable case (most VLM processors require `images=`
-                # and will raise if called without one) — skip explicitly
-                # instead of falling through to a text-only encode path that
-                # silently crashes for every record.
                 no_image_count += 1
                 skipped += 1
                 continue
@@ -642,8 +561,6 @@ class FeatureEngineeringAgent:
                 if msg not in seen_errors and len(error_samples) < 5:
                     seen_errors.add(msg)
                     error_samples.append(msg)
-                # Surfaced at WARNING (not DEBUG) so it is visible at default
-                # INFO log level instead of being silently swallowed.
                 logger.warning(f"[FeatureEng] Record {i} encoding failed: {msg}")
                 skipped += 1
                 continue
@@ -656,6 +573,27 @@ class FeatureEngineeringAgent:
                 del image
                 if (i + 1) % GC_EVERY == 0:
                     gc.collect()
+                # PROGRESS LOGGING: previously the loop body had no
+                # per-record logging at all, so on large datasets (esp.
+                # on CPU, where each vision encode call is slow) nothing
+                # was printed between the max_len probe line and the
+                # final summary — a healthy multi-minute run looked
+                # identical to a hang. This emits a status line every
+                # PROGRESS_EVERY records (and always on the last record)
+                # with running counts and an ETA based on elapsed time.
+                if (i + 1) % PROGRESS_EVERY == 0 or (i + 1) == total:
+                    elapsed = time.time() - t_start
+                    rate = (i + 1) / elapsed if elapsed > 0 else 0.0
+                    remaining = total - (i + 1)
+                    eta_sec = remaining / rate if rate > 0 else float("inf")
+                    eta_str = f"{eta_sec / 60:.1f} min" if eta_sec != float("inf") else "unknown"
+                    logger.info(
+                        f"[FeatureEng] Progress: {i + 1}/{total} records "
+                        f"processed — encoded={len(encoded)} skipped={skipped} "
+                        f"no_image={no_image_count}  "
+                        f"rate={rate:.2f} rec/s  elapsed={elapsed:.1f}s  "
+                        f"ETA={eta_str}"
+                    )
 
         gc.collect()
         logger.info(f"[FeatureEng] Encoded {len(encoded)} records. Skipped {skipped}.")
@@ -698,11 +636,6 @@ class FeatureEngineeringAgent:
         if not isinstance(entry["input_ids"], list) or len(entry["input_ids"]) == 0:
             return f"input_ids not a non-empty list (got {type(entry['input_ids']).__name__})"
 
-        # Guard against the exact bug this revision fixes: reject any entry
-        # whose labels are identical to input_ids (i.e. completely
-        # unmasked). A real masked entry should differ from input_ids
-        # unless every single token happens to be part of the answer span
-        # (essentially never true once padding/prompt exist).
         labels = entry["labels"]
         if isinstance(labels, list) and labels == entry["input_ids"]:
             return "labels identical to input_ids — masking did not run (would train on prompt/padding tokens)"
@@ -747,12 +680,6 @@ class FeatureEngineeringAgent:
 
         return self._flatten_sequence_fields(entry) if entry else entry
 
-    # Expected per-example rank (after unwrapping) for each tensor field.
-    # input_ids/attention_mask/labels/qformer_* are 1-D token sequences.
-    # pixel_values is handled separately below (see _flatten_sequence_fields)
-    # because its target rank genuinely varies by model family (3 for a
-    # single [C,H,W] image, 4 for [num_images,C,H,W]) — everything else
-    # here is unambiguous.
     _SEQUENCE_FIELD_TARGET_RANK = {
         "input_ids": 1, "attention_mask": 1, "labels": 1,
         "image_grid_thw": 2,
@@ -760,55 +687,6 @@ class FeatureEngineeringAgent:
     }
 
     def _flatten_sequence_fields(self, entry: Dict) -> Dict:
-        """
-        Normalize every tensor-bound field to its per-example shape by
-        stripping ALL extra leading singleton ("batch-of-one") dimensions,
-        regardless of how many there are or whether the underlying HF
-        processor returned a nested python list or a raw numpy/torch array.
-
-        ROOT CAUSE this fixes (two related bugs found across model
-        families):
-
-        1) HF processors always treat their input as a batch internally,
-           even for a single example. With return_tensors=None this
-           surfaces as a length-1 outer list wrapping the real per-example
-           value — e.g. input_ids as [[id, id, ...]] instead of
-           [id, id, ...]. Saving that wrapped shape into the HF Dataset
-           corrupts the per-example rank seen by every downstream
-           consumer (torch.as_tensor() on a saved example yields rank 2
-           instead of rank 1).
-
-        2) Some processors (observed with InstructBLIP) wrap MORE than
-           one extra leading dim onto pixel_values — e.g. shape
-           (1, 1, 3, H, W), a (batch=1, num_images=1, C, H, W) — AND
-           return it as a raw numpy array rather than a nested python
-           list. The previous version of this method only stripped a
-           SINGLE layer of wrapping, and its wrapper-detection required
-           `isinstance(val, list)` at the top level, so a raw numpy array
-           never matched at all and passed through completely untouched —
-           silently propagating a rank-5 pixel_values into every encoded
-           record, which then got rejected by _validate_entry's rank
-           check 100% of the time ("instructblip pixel_values rank=5
-           (expected 3 or 4)"), failing the entire encoding pass for that
-           model family with zero successfully encoded records.
-
-        Fix: convert to a numpy array up front (works for both nested
-        lists and arrays/tensors), then strip leading dims of size 1 in a
-        loop until the target per-example rank is reached, however many
-        extra dims that takes. token-sequence fields always target rank 1.
-        pixel_values targets rank 3 or 4 depending on what's already
-        present after one strip (see logic below) — vision processors are
-        not fully consistent about whether per-example image tensors
-        should keep a leading "num_images" axis, so we infer the right
-        target from the family-appropriate range (3..4) rather than
-        hard-coding one value.
-
-        Unwrapping all of these here, once, at the only place every
-        encoder funnels through, keeps every downstream consumer
-        (TrainingAgent's validator, the Qwen-VL collator,
-        default_data_collator, _validate_entry below) working with a
-        single consistent per-example-shape contract.
-        """
         import numpy as np
 
         def _strip_to_rank(val, target_rank: int):
@@ -822,30 +700,14 @@ class FeatureEngineeringAgent:
                 try:
                     entry[key] = _strip_to_rank(entry[key], target_rank)
                 except Exception:
-                    pass  # leave as-is; downstream validation will catch real problems
+                    pass
 
         if "pixel_values" in entry and entry["pixel_values"] is not None:
             try:
                 arr = np.asarray(entry["pixel_values"])
-                # Strip down to rank 4 first (the common [num_images,C,H,W]
-                # per-example shape used by BLIP-2/InstructBLIP/LLaVA/
-                # Phi-vision). If what's left still has a leading dim of
-                # size 1 AND stripping further would still land at a valid
-                # rank (3, i.e. plain [C,H,W]), strip one more — this
-                # covers processors that don't keep a num_images axis.
                 while arr.ndim > 4 and arr.shape[0] == 1:
                     arr = arr[0]
                 if arr.ndim == 4 and arr.shape[0] == 1:
-                    # Ambiguous: could be a real [num_images=1,C,H,W] (keep)
-                    # or one more stray wrapper layer over [C,H,W] (strip).
-                    # Peeking one level down tells us which: if arr[0] is
-                    # itself rank-3 and looks like a plausible image
-                    # (C in {1,3,4}, H and W both > 4), it's a real image
-                    # tensor at rank 4 we should keep as-is for vision
-                    # families that expect [num_images,C,H,W]. We leave
-                    # this decision to the per-family validator rather
-                    # than guess further here — rank 4 is already an
-                    # accepted rank, so we stop unwrapping at this point.
                     pass
                 entry["pixel_values"] = arr.tolist()
             except Exception:
@@ -896,12 +758,6 @@ class FeatureEngineeringAgent:
         return result
 
     def _encode_llava(self, question, answer, image, processor, max_len) -> Dict:
-        """
-        FIXED: previously did `result["labels"] = input_ids[:]` (no
-        masking at all). Now tokenizes the prompt portion alone first to
-        find prompt_len, then masks everything before the answer span
-        (plus padding) to -100.
-        """
         prompt_text = f"USER: <image>\n{question}\nASSISTANT:"
         full_text   = f"{prompt_text} {answer}"
 
@@ -925,46 +781,8 @@ class FeatureEngineeringAgent:
         return result
 
     def _encode_qwen_vl(self, question, answer, image, processor, max_len) -> Dict:
-        """
-        FIXED (label masking): previously did `result["labels"] =
-        input_ids[:]` (no masking at all) — this was the primary cause of
-        0.0 eval metrics. Now tokenizes the chat-template prompt alone (no
-        answer appended) to find exactly how many leading tokens are
-        prompt/image/scaffolding, then masks labels[:prompt_len] = -100
-        plus all padding tokens. Only the answer span remains a real loss
-        target.
-
-        FIXED (this revision — all-masked-labels regression): Qwen2.5-VL's
-        chat template inserts a single <|image_pad|> placeholder that the
-        processor then EXPANDS into many image-patch tokens internally
-        (the count scales with image resolution and is NOT capped by
-        model_plan's max_seq_len — that cap only truncates the final
-        encoded sequence). With a small max_seq_len (e.g. 128, sized for
-        text-only models), the expanded image-token prompt alone can
-        exceed max_len before the answer ever appears. The previous
-        version measured prompt_len from an encoding that was ITSELF
-        truncated to max_len, so prompt_len silently saturated at exactly
-        max_len whenever this happened — and _mask_prompt_and_padding then
-        masked every single position (0..max_len-1), since all of them
-        satisfied `index < prompt_len`. Every record failed
-        FeatureEngineeringAgent's "fully masked" validator, and 100% of
-        records were skipped — encoding produced 0 valid records.
-
-        Fix: `max_len` passed in here is now expected to already be sized
-        correctly for this model (see _resolve_effective_max_len, called
-        once per dataset in _encode_records — NOT per record, since every
-        record in the dataset must share one fixed padded length for
-        batching to work). This method still measures the prompt's TRUE,
-        un-truncated length to compute the mask boundary, but no longer
-        tries to grow max_len itself mid-encode (that would produce
-        variable-length records that break collation). If a single
-        record's prompt is so long it still doesn't leave room for any
-        answer token even at the dataset-level max_len, that one record is
-        skipped explicitly with a clear reason instead of being silently
-        corrupted into an all-masked record.
-        """
         tok = getattr(processor, "tokenizer", processor)
-        min_answer_tokens = 4  # floor: must leave room for at least a few answer tokens + EOS
+        min_answer_tokens = 4
 
         if image is not None and hasattr(processor, "apply_chat_template"):
             messages = [{"role": "user", "content": [
@@ -974,13 +792,6 @@ class FeatureEngineeringAgent:
                 messages, tokenize=False, add_generation_prompt=True)
             full_text = prompt_text + answer
 
-            # Measure the prompt's TRUE length (image tokens expanded, NOT
-            # truncated) so we can tell whether it leaves room for any
-            # answer tokens within the dataset's fixed max_len. Must go
-            # through _unwrap_token_ids — with return_tensors=None a
-            # processor commonly wraps input_ids as [[id, id, ...]] for a
-            # single example, and a raw len() would measure that outer
-            # wrapper (always 1) instead of the real token count.
             prompt_only_enc = processor(text=prompt_text, images=[image],
                                          return_tensors=None, truncation=False)
             true_prompt_len = len(self._unwrap_token_ids(prompt_only_enc["input_ids"]))
@@ -1021,13 +832,6 @@ class FeatureEngineeringAgent:
                       truncation=True, max_length=max_len)
 
         result = {k: v for k, v in enc.items()}
-        # Unwrap input_ids/attention_mask BEFORE masking — `enc` (the
-        # padded encoding) can carry the same batch-of-one wrapping as the
-        # prompt-only probe above. Masking against a wrapped [[...]]
-        # sequence would operate on the outer 1-element wrapper instead of
-        # the real per-token sequence, producing garbage labels (this is
-        # the same class of bug that made _resolve_effective_max_len's
-        # probe report "1 token" instead of the real prompt length).
         result["input_ids"] = self._unwrap_token_ids(result["input_ids"])
         if "attention_mask" in result:
             result["attention_mask"] = self._unwrap_token_ids(result["attention_mask"])
@@ -1036,21 +840,11 @@ class FeatureEngineeringAgent:
 
         if "image_grid_thw" in result:
             g = result["image_grid_thw"]
-            # Some processor versions wrap this as [[t,h,w]] (batch-of-one)
-            # instead of [t,h,w] per image — normalize to the flat form so
-            # the qwen_vl_collator's reshape(-1, 3) in TrainingAgent always
-            # receives a consistent shape regardless of processor version.
             if isinstance(g, list) and len(g) == 1 and isinstance(g[0], list) and isinstance(g[0][0], list):
                 result["image_grid_thw"] = g[0]
         return result
 
     def _encode_phi_vision(self, question, answer, image, processor, max_len) -> Dict:
-        """
-        FIXED: previously did `result["labels"] = input_ids[:]` (no
-        masking at all). Now tokenizes the prompt portion alone first to
-        find prompt_len, then masks everything before the answer span
-        (plus padding) to -100.
-        """
         if image is not None:
             prompt_text = f"<|user|>\n<|image_1|>\n{question}<|end|>\n<|assistant|>\n"
             full_text   = f"{prompt_text}{answer}<|end|>"
@@ -1095,23 +889,6 @@ class FeatureEngineeringAgent:
             return None
 
     def _resolve_record_image(self, rec: Dict[str, Any]):
-        """
-        Resolve a usable PIL.Image from a processed record, regardless of
-        how DataPreprocessingAgent represented it. This is the fix for the
-        "0 encoded / N skipped" failure: HF image datasets (e.g.
-        flaviagiammarino/vqa-rad) commonly carry the image as an embedded
-        PIL object, raw bytes, or a {"bytes":..., "path":...} dict rather
-        than a filesystem path string in 'image_path' — the old code only
-        ever checked 'image_path', so every record silently fell through
-        to a no-image encode path that crashes for processors (like
-        InstructBLIP's) that require `images=` to be set.
-
-        Tries, in order:
-          1. rec['image_path']      — filesystem path (original behaviour)
-          2. rec['image']           — PIL.Image, raw bytes, numpy array, or
-                                       a HF datasets-style {"bytes","path"} dict
-        Returns a PIL.Image in RGB mode, or None if nothing usable is found.
-        """
         from PIL import Image
         import io
 
@@ -1140,17 +917,13 @@ class FeatureEngineeringAgent:
             if isinstance(raw, (bytes, bytearray)):
                 return Image.open(io.BytesIO(raw)).convert("RGB")
             if isinstance(raw, str):
-                # Possible base64-encoded image string (with or without a
-                # data: URI prefix) — some preprocessing pipelines serialize
-                # images this way to keep everything in a single JSONL field.
                 import base64
                 s = raw.split(",", 1)[-1] if raw.startswith("data:") else raw
                 try:
                     decoded = base64.b64decode(s, validate=True)
                     return Image.open(io.BytesIO(decoded)).convert("RGB")
                 except Exception:
-                    return self._load_image(raw)  # maybe it's actually a path
-            # numpy array or similar array-like
+                    return self._load_image(raw)
             import numpy as np
             if isinstance(raw, np.ndarray):
                 return Image.fromarray(raw).convert("RGB")
@@ -1233,13 +1006,6 @@ class FeatureEngineeringAgent:
 
 
 def _shape_of(x) -> List[int]:
-    """
-    Pure-python shape inference, used only as a fallback when torch is
-    unavailable. Handles plain nested python lists AND numpy/torch arrays
-    (which commonly appear as the innermost element of a processor's
-    output) — without this, hitting an array mid-walk would stop the walk
-    immediately and misreport a multi-dimensional value as rank 1.
-    """
     shape: List[int] = []
     cur = x
     while True:
