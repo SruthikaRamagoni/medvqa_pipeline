@@ -47,7 +47,7 @@ prompt/image/scaffolding. That length is used to mask labels[:prompt_len]
 present before truncation) remains a real loss target — which is the
 standard, correct recipe for instruction/VQA fine-tuning.
 
-PROGRESS LOGGING (this revision)
+PROGRESS LOGGING (previous revision)
 ----------------------------------
 _encode_records previously had no logging at all inside its main
 per-record loop, so on large datasets (e.g. 2244 records) the only
@@ -57,6 +57,32 @@ a single summary line. This made a slow-but-healthy run indistinguishable
 from a genuine hang. A periodic progress line (every 100 records, plus
 the final record) is now emitted with running encoded/skipped/no_image
 counts so progress is visible in real time.
+
+STREAMING / OOM FIX (this revision)
+----------------------------------
+ROOT CAUSE of "tried to allocate more memory than is available" crash
+(observed right at the END of encoding, ~2224/2244 records in):
+the old _encode_records returned a plain Python `list` that accumulated
+EVERY encoded record — including each record's full `pixel_values`
+nested list — in RAM simultaneously, for the entire dataset, before a
+single byte was written to disk. _build_hf_datasets then called
+`Dataset.from_list(encoded)`, which materializes a SECOND full copy of
+the same data while building the Arrow table. For Qwen2.5-VL-sized
+pixel_values across ~2000+ records, two simultaneous full-dataset copies
+in memory (one as raw Python lists, one being converted to Arrow) is
+exactly the kind of peak that exhausts RAM right as the final records are
+processed/converted — which matches the crash happening at the very end
+of the run, not partway through.
+
+FIX: _encode_records is now a *generator* (_encode_records_gen) that
+yields one encoded record at a time instead of building a list. It is
+fed directly into `datasets.Dataset.from_generator(...)`, which writes
+each record to Arrow on disk incrementally (in small writer batches)
+as it's produced — so at no point does the full dataset exist twice (or
+even once) fully materialized in Python-list form in memory. Only the
+already-Arrow-backed (memory-mapped, not RAM-resident) Dataset exists
+afterward, which is then split into train/val via `.select(...)` ranges
+rather than slicing Python lists.
 """
 
 from phi.agent import Agent
@@ -203,11 +229,33 @@ class FeatureEngineeringAgent:
         if processor is None and tokenizer is None:
             return self._fail(f"Could not load processor for {hf_id}")
 
-        encoded = self._encode_records(
-            records, processor, tokenizer,
-            model_family, is_vision, architecture, max_len,
-        )
-        if not encoded:
+        # STREAMING PATH: resolve the effective max_len once up front (same
+        # as before — this still needs to run before any record is encoded
+        # so every record shares one fixed padded length), then hand a
+        # *generator* to Dataset.from_generator so records are written to
+        # Arrow on disk one at a time instead of being accumulated as a
+        # Python list first. See module docstring "STREAMING / OOM FIX".
+        max_len = self._resolve_effective_max_len(records, processor, model_family, max_len)
+        self._last_encode_diagnostics = {}  # populated by the generator as it runs
+
+        try:
+            from datasets import Dataset
+            full_ds = Dataset.from_generator(
+                self._encode_records_gen,
+                gen_kwargs={
+                    "records": records,
+                    "processor": processor,
+                    "tokenizer": tokenizer,
+                    "model_family": model_family,
+                    "is_vision": is_vision,
+                    "architecture": architecture,
+                    "max_len": max_len,
+                },
+            )
+        except Exception as e:
+            return self._fail(f"Streaming encode failed: {type(e).__name__}: {e}")
+
+        if len(full_ds) == 0:
             diag = getattr(self, "_last_encode_diagnostics", {})
             detail = ""
             if diag.get("no_image_count"):
@@ -220,7 +268,13 @@ class FeatureEngineeringAgent:
                 detail = f" Sample errors: {diag['error_samples']}"
             return self._fail(f"Encoding produced no valid records.{detail}")
 
-        train_ds, val_ds = self._build_hf_datasets(encoded)
+        # Split the already Arrow-backed (memory-mapped) dataset via index
+        # ranges — .select() does not load the whole dataset into RAM, so
+        # this is safe even for large pixel_values columns.
+        n = len(full_ds)
+        split = max(1, int(n * 0.9))
+        train_ds = full_ds.select(range(split))
+        val_ds   = full_ds.select(range(split, n)) if split < n else full_ds.select(range(max(0, n - 1), n))
 
         saved_path = self._save_to_disk(train_ds, val_ds, feature_path, target_meta)
         logger.info(
@@ -504,16 +558,30 @@ class FeatureEngineeringAgent:
             )
         return resolved
 
-    def _encode_records(
+    def _encode_records_gen(
         self, records, processor, tokenizer, model_family, is_vision, architecture, max_len,
-    ) -> List[Dict]:
+    ):
+        """
+        Generator version of the old _encode_records. Yields one encoded
+        (and validated) record dict at a time instead of accumulating a
+        Python list — this is what lets Dataset.from_generator write each
+        record straight to Arrow on disk as it's produced, so the full
+        dataset's pixel_values are never simultaneously resident in RAM as
+        plain Python lists (see module docstring "STREAMING / OOM FIX").
+
+        NOTE: `max_len` here is expected to already be the *resolved*
+        effective max_len (engineer_features calls
+        _resolve_effective_max_len once, up front, before constructing
+        this generator) — this method does NOT call it itself, since
+        gen_kwargs are re-passed verbatim by datasets internals and the
+        probe must only run once per dataset, not once per generator
+        invocation/retry.
+        """
         import gc, time
 
-        max_len = self._resolve_effective_max_len(records, processor, model_family, max_len)
-
-        encoded = []
         skipped = 0
         no_image_count = 0
+        encoded_count = 0
         error_samples: List[str] = []
         seen_errors: set = set()
 
@@ -522,48 +590,44 @@ class FeatureEngineeringAgent:
         total = len(records)
         t_start = time.time()
 
-        logger.info(f"[FeatureEng] Starting encode loop over {total} records …")
+        logger.info(f"[FeatureEng] Starting streaming encode over {total} records …")
 
         for i, rec in enumerate(records):
             question = rec.get("question", "").strip()
             answer   = rec.get("answer",   "").strip()
             image    = self._resolve_record_image(rec)
 
-            if not question or not answer:
-                skipped += 1
-                if image is not None:
-                    try:
-                        image.close()
-                    except Exception:
-                        pass
-                continue
-
-            if is_vision and image is None:
-                no_image_count += 1
-                skipped += 1
-                continue
-
             try:
-                entry = self._encode_single(
-                    question, answer, image, processor, tokenizer,
-                    model_family, architecture, max_len,
-                )
-                reject_reason = self._validate_entry(entry, model_family) if entry else "encode_single returned None/empty"
-                if entry and not reject_reason:
-                    encoded.append(entry)
-                else:
-                    if reject_reason and reject_reason not in seen_errors and len(error_samples) < 5:
-                        seen_errors.add(reject_reason)
-                        error_samples.append(f"validation_rejected: {reject_reason}")
+                if not question or not answer:
                     skipped += 1
-            except Exception as e:
-                msg = f"{type(e).__name__}: {e}"
-                if msg not in seen_errors and len(error_samples) < 5:
-                    seen_errors.add(msg)
-                    error_samples.append(msg)
-                logger.warning(f"[FeatureEng] Record {i} encoding failed: {msg}")
-                skipped += 1
-                continue
+                    continue
+
+                if is_vision and image is None:
+                    no_image_count += 1
+                    skipped += 1
+                    continue
+
+                try:
+                    entry = self._encode_single(
+                        question, answer, image, processor, tokenizer,
+                        model_family, architecture, max_len,
+                    )
+                    reject_reason = self._validate_entry(entry, model_family) if entry else "encode_single returned None/empty"
+                    if entry and not reject_reason:
+                        encoded_count += 1
+                        yield entry
+                    else:
+                        if reject_reason and reject_reason not in seen_errors and len(error_samples) < 5:
+                            seen_errors.add(reject_reason)
+                            error_samples.append(f"validation_rejected: {reject_reason}")
+                        skipped += 1
+                except Exception as e:
+                    msg = f"{type(e).__name__}: {e}"
+                    if msg not in seen_errors and len(error_samples) < 5:
+                        seen_errors.add(msg)
+                        error_samples.append(msg)
+                    logger.warning(f"[FeatureEng] Record {i} encoding failed: {msg}")
+                    skipped += 1
             finally:
                 if image is not None:
                     try:
@@ -573,14 +637,6 @@ class FeatureEngineeringAgent:
                 del image
                 if (i + 1) % GC_EVERY == 0:
                     gc.collect()
-                # PROGRESS LOGGING: previously the loop body had no
-                # per-record logging at all, so on large datasets (esp.
-                # on CPU, where each vision encode call is slow) nothing
-                # was printed between the max_len probe line and the
-                # final summary — a healthy multi-minute run looked
-                # identical to a hang. This emits a status line every
-                # PROGRESS_EVERY records (and always on the last record)
-                # with running counts and an ETA based on elapsed time.
                 if (i + 1) % PROGRESS_EVERY == 0 or (i + 1) == total:
                     elapsed = time.time() - t_start
                     rate = (i + 1) / elapsed if elapsed > 0 else 0.0
@@ -589,14 +645,14 @@ class FeatureEngineeringAgent:
                     eta_str = f"{eta_sec / 60:.1f} min" if eta_sec != float("inf") else "unknown"
                     logger.info(
                         f"[FeatureEng] Progress: {i + 1}/{total} records "
-                        f"processed — encoded={len(encoded)} skipped={skipped} "
+                        f"processed — encoded={encoded_count} skipped={skipped} "
                         f"no_image={no_image_count}  "
                         f"rate={rate:.2f} rec/s  elapsed={elapsed:.1f}s  "
                         f"ETA={eta_str}"
                     )
 
         gc.collect()
-        logger.info(f"[FeatureEng] Encoded {len(encoded)} records. Skipped {skipped}.")
+        logger.info(f"[FeatureEng] Encoded {encoded_count} records. Skipped {skipped}.")
         if no_image_count:
             sample_keys = list(records[0].keys()) if records else []
             sample_image_val = records[0].get("image", records[0].get("image_path", "<absent>")) if records else None
@@ -622,7 +678,6 @@ class FeatureEngineeringAgent:
             "error_samples": error_samples,
             "total_records": len(records),
         }
-        return encoded
 
     def _validate_entry(self, entry: Dict, model_family: str) -> str:
         """Returns '' if entry is valid, otherwise a short reason string
@@ -932,14 +987,6 @@ class FeatureEngineeringAgent:
         return None
 
     # ── HuggingFace Dataset / cache persistence ────────────────────────────────
-
-    def _build_hf_datasets(self, encoded: List[Dict]):
-        from datasets import Dataset
-        n     = len(encoded)
-        split = max(1, int(n * 0.9))
-        train_ds = Dataset.from_list(encoded[:split])
-        val_ds   = Dataset.from_list(encoded[split:] or encoded[-1:])
-        return train_ds, val_ds
 
     def _save_to_disk(self, train_ds, val_ds, feature_path: str, meta: Dict[str, Any]) -> str:
         import time
