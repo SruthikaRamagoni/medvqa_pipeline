@@ -345,9 +345,13 @@ class FeatureEngineeringAgent:
                     question, answer, image, processor, tokenizer,
                     model_family, architecture, max_len,
                 )
-                if entry and self._validate_entry(entry, model_family):
+                reject_reason = self._validate_entry(entry, model_family) if entry else "encode_single returned None/empty"
+                if entry and not reject_reason:
                     encoded.append(entry)
                 else:
+                    if reject_reason and reject_reason not in seen_errors and len(error_samples) < 5:
+                        seen_errors.add(reject_reason)
+                        error_samples.append(f"validation_rejected: {reject_reason}")
                     skipped += 1
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
@@ -380,7 +384,7 @@ class FeatureEngineeringAgent:
                 f"must be re-exported to disk as actual image files."
             )
         if error_samples:
-            logger.warning(f"[FeatureEng] Sample encoding errors: {error_samples}")
+            logger.warning(f"[FeatureEng] Sample encoding/validation errors: {error_samples}")
         self._last_encode_diagnostics = {
             "no_image_count": no_image_count,
             "error_samples": error_samples,
@@ -388,13 +392,20 @@ class FeatureEngineeringAgent:
         }
         return encoded
 
-    def _validate_entry(self, entry: Dict, model_family: str) -> bool:
-        """Reject entries with missing or structurally invalid tensor fields."""
-        if "input_ids" not in entry or "labels" not in entry:
-            return False
+    def _validate_entry(self, entry: Dict, model_family: str) -> str:
+        """Returns '' if entry is valid, otherwise a short reason string
+        explaining why it was rejected (used both to skip bad records and
+        to surface a diagnosable cause in engineer_features()'s failure
+        message instead of an opaque 'skipped' count)."""
+        if "input_ids" not in entry:
+            return "missing input_ids"
+        if "labels" not in entry:
+            return "missing labels"
         if not isinstance(entry["input_ids"], list) or len(entry["input_ids"]) == 0:
-            return False
-        if model_family in VISION_FAMILIES and "pixel_values" in entry:
+            return f"input_ids not a non-empty list (got {type(entry['input_ids']).__name__})"
+        if model_family in VISION_FAMILIES:
+            if "pixel_values" not in entry:
+                return "vision model but 'pixel_values' missing from encoded entry (processor call likely returned no image tensor)"
             pv = entry["pixel_values"]
             try:
                 import torch
@@ -403,13 +414,11 @@ class FeatureEngineeringAgent:
                 rank = len(_shape_of(pv))
             if model_family == "qwen_vl":
                 if rank not in (2, 3):
-                    logger.debug(f"[FeatureEng] Rejected qwen_vl pixel_values rank={rank}")
-                    return False
+                    return f"qwen_vl pixel_values rank={rank} (expected 2 or 3)"
             else:
                 if rank not in (3, 4):
-                    logger.debug(f"[FeatureEng] Rejected {model_family} pixel_values rank={rank}")
-                    return False
-        return True
+                    return f"{model_family} pixel_values rank={rank} (expected 3 or 4)"
+        return ""
 
     def _encode_single(
         self, question, answer, image, processor, tokenizer,
