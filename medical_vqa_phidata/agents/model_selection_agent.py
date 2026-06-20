@@ -185,7 +185,7 @@ class ModelSelectionAgent:
 
         use_4bit = (vram_gb < best["min_vram"]) and (device == "cuda")
         family   = self._detect_model_family(best["hf_id"])
-        compat   = self._compat_metadata(family)
+        compat   = self._compat_metadata(family, best["hf_id"])
 
         plan = {
             # Identity
@@ -286,7 +286,7 @@ class ModelSelectionAgent:
 
     # ── Compatibility metadata per family ──────────────────────────────────────
 
-    def _compat_metadata(self, family: str) -> Dict[str, str]:
+    def _compat_metadata(self, family: str, hf_id: str = "") -> Dict[str, str]:
         table = {
             "flan_t5":       dict(loader="AutoModelForSeq2SeqLM",
                                    processor_type="AutoTokenizer",
@@ -318,7 +318,11 @@ class ModelSelectionAgent:
                                    feature_strategy="vision2seq",
                                    collator_type="default_data_collator",
                                    tensor_schema="pixel_values[b,3,H,W], input_ids[b,s], labels[b,s]"),
-            "qwen_vl":       dict(loader="auto",  # resolved by TrainingAgent (Qwen2_5_VL / Qwen2VL)
+            "qwen_vl":       dict(loader=(
+                                       "Qwen2_5_VLForConditionalGeneration"
+                                       if "qwen2.5-vl" in hf_id.lower()
+                                       else "Qwen2VLForConditionalGeneration"
+                                   ),
                                    processor_type="AutoProcessor",
                                    feature_strategy="vision2seq_patchified",
                                    collator_type="qwen_vl_collator",
