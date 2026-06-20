@@ -240,18 +240,31 @@ class FeatureEngineeringAgent:
 
         try:
             from datasets import Dataset
-            full_ds = Dataset.from_generator(
+            from functools import partial
+            # IMPORTANT: do NOT pass `records` (a list) via gen_kwargs.
+            # Dataset.from_generator treats any list-valued gen_kwargs entry
+            # as a set of per-shard arguments and calls the generator ONCE
+            # PER ELEMENT of that list (this is meant for multiprocess
+            # sharding, e.g. gen_kwargs={"files": [f1, f2, ...]} -> one
+            # call per file). Passing our 2244-record list this way caused
+            # the generator to be invoked 2244 separate times, each with
+            # a single-record "records" list — exactly what produced the
+            # "Starting streaming encode over 1 records" spam repeated
+            # thousands of times in the logs instead of one real run.
+            # Binding everything via functools.partial (a closure) instead
+            # avoids gen_kwargs entirely, so `records` is passed through
+            # untouched as one full list to one single generator call.
+            gen = partial(
                 self._encode_records_gen,
-                gen_kwargs={
-                    "records": records,
-                    "processor": processor,
-                    "tokenizer": tokenizer,
-                    "model_family": model_family,
-                    "is_vision": is_vision,
-                    "architecture": architecture,
-                    "max_len": max_len,
-                },
+                records=records,
+                processor=processor,
+                tokenizer=tokenizer,
+                model_family=model_family,
+                is_vision=is_vision,
+                architecture=architecture,
+                max_len=max_len,
             )
+            full_ds = Dataset.from_generator(gen)
         except Exception as e:
             return self._fail(f"Streaming encode failed: {type(e).__name__}: {e}")
 
@@ -586,7 +599,7 @@ class FeatureEngineeringAgent:
         seen_errors: set = set()
 
         GC_EVERY = 200
-        PROGRESS_EVERY = 100
+        PROGRESS_EVERY = 250
         total = len(records)
         t_start = time.time()
 
