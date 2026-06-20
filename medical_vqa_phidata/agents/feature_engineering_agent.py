@@ -1169,17 +1169,36 @@ class FeatureEngineeringAgent:
         return train_ds, val_ds
 
     def _save_to_disk(self, train_ds, val_ds, feature_path: str, meta: Dict[str, Any]) -> str:
+        import time
         base_path = Path(feature_path)
         base_path.mkdir(parents=True, exist_ok=True)
+
+        logger.info(
+            f"[FeatureEng] Saving to disk — train={len(train_ds)} "
+            f"val={len(val_ds)} records (this can take a while for "
+            f"vision datasets with pixel_values; no per-shard progress is "
+            f"logged by datasets.save_to_disk itself, so a multi-minute "
+            f"gap here is expected for larger datasets, not a hang)."
+        )
+        t0 = time.time()
         train_ds.save_to_disk(str(base_path / "train"))
+        logger.info(f"[FeatureEng] train/ saved in {time.time() - t0:.1f}s")
+
+        t1 = time.time()
         val_ds.save_to_disk(str(base_path / "val"))
+        logger.info(f"[FeatureEng] val/ saved in {time.time() - t1:.1f}s")
+
         (base_path / "metadata.json").write_text(json.dumps(meta, indent=2, default=str))
-        logger.info(f"[FeatureEng] Saved to {base_path} (metadata.json written)")
+        logger.info(
+            f"[FeatureEng] Saved to {base_path} (metadata.json written) — "
+            f"total save time {time.time() - t0:.1f}s"
+        )
         return str(base_path)
 
     # ── LLM assessment ────────────────────────────────────────────────────────
 
     def _get_llm_assessment(self, hf_id, model_family, is_vision, train_n, val_n, columns) -> Dict:
+        import time
         prompt = (
             f"Feature engineering completed for Medical VQA.\n"
             f"Model: {hf_id}\nFamily: {model_family}  Vision: {is_vision}\n"
@@ -1189,11 +1208,17 @@ class FeatureEngineeringAgent:
             f'Reply with ONLY: {{"status": "ok", "train_samples": {train_n}, '
             f'"val_samples": {val_n}, "message": "<one sentence>"}}'
         )
+        logger.info("[FeatureEng] Requesting LLM assessment (Groq) …")
+        t0 = time.time()
         try:
             response = self.agent.run(prompt)
+            logger.info(f"[FeatureEng] LLM assessment returned in {time.time() - t0:.1f}s")
             return self._parse_response(response)
         except Exception as e:
-            logger.warning(f"[FeatureEng] LLM assessment failed: {e}")
+            logger.warning(
+                f"[FeatureEng] LLM assessment failed after "
+                f"{time.time() - t0:.1f}s: {e}"
+            )
             return {"status": "ok", "message": "Feature engineering complete."}
 
     def _parse_response(self, response) -> Dict:
