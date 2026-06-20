@@ -362,11 +362,22 @@ class FeatureEngineeringAgent:
 
         logger.info(f"[FeatureEng] Encoded {len(encoded)} records. Skipped {skipped}.")
         if no_image_count:
+            sample_keys = list(records[0].keys()) if records else []
+            sample_image_val = records[0].get("image", records[0].get("image_path", "<absent>")) if records else None
+            sample_image_type = type(sample_image_val).__name__
             logger.warning(
                 f"[FeatureEng] {no_image_count}/{len(records)} records had no "
                 f"usable image for a vision model (model_family={model_family}). "
-                f"Check that DataPreprocessingAgent is populating 'image_path' "
-                f"or 'image' (PIL/bytes) on each record."
+                f"First record keys={sample_keys}  "
+                f"'image'/'image_path' field type={sample_image_type}  "
+                f"value_preview={str(sample_image_val)[:120]!r}. "
+                f"Check DataPreprocessingAgent's JSONL output schema — "
+                f"_resolve_record_image() expects 'image_path' (filesystem "
+                f"string), or 'image' as a PIL object, raw bytes, "
+                f"{{'bytes':..,'path':..}} dict, or numpy array. If the JSONL "
+                f"only stores a dataset index / HF dataset row id, the image "
+                f"is being dropped during JSON serialization upstream and "
+                f"must be re-exported to disk as actual image files."
             )
         if error_samples:
             logger.warning(f"[FeatureEng] Sample encoding errors: {error_samples}")
@@ -405,18 +416,49 @@ class FeatureEngineeringAgent:
         model_family, architecture, max_len,
     ) -> Optional[Dict]:
         if model_family in ("flan_t5", "seq2seq"):
-            return self._encode_seq2seq(question, answer, tokenizer, max_len)
-        if model_family == "blip2":
-            return self._encode_blip2(question, answer, image, processor, max_len)
-        if model_family == "instructblip":
-            return self._encode_instructblip(question, answer, image, processor, max_len)
-        if model_family == "llava":
-            return self._encode_llava(question, answer, image, processor, max_len)
-        if model_family == "qwen_vl":
-            return self._encode_qwen_vl(question, answer, image, processor, max_len)
-        if model_family == "phi_vision":
-            return self._encode_phi_vision(question, answer, image, processor, max_len)
-        return self._encode_causal(question, answer, tokenizer, max_len)
+            entry = self._encode_seq2seq(question, answer, tokenizer, max_len)
+        elif model_family == "blip2":
+            entry = self._encode_blip2(question, answer, image, processor, max_len)
+        elif model_family == "instructblip":
+            entry = self._encode_instructblip(question, answer, image, processor, max_len)
+        elif model_family == "llava":
+            entry = self._encode_llava(question, answer, image, processor, max_len)
+        elif model_family == "qwen_vl":
+            entry = self._encode_qwen_vl(question, answer, image, processor, max_len)
+        elif model_family == "phi_vision":
+            entry = self._encode_phi_vision(question, answer, image, processor, max_len)
+        else:
+            entry = self._encode_causal(question, answer, tokenizer, max_len)
+
+        return self._flatten_sequence_fields(entry) if entry else entry
+
+    def _flatten_sequence_fields(self, entry: Dict) -> Dict:
+        """
+        Normalize 'input_ids' / 'attention_mask' / 'labels' to a flat
+        per-example list[int] (rank 1), regardless of how the underlying
+        HF processor shaped them.
+
+        ROOT CAUSE this fixes: several processors (notably Qwen2.5-VL's
+        AutoProcessor, even when called with return_tensors=None) still
+        return these fields as a batch-of-one nested list — [[id, id, ...]]
+        instead of [id, id, ...] — because the processor always treats its
+        input as a batch internally. Saving that nested shape directly into
+        the HF Dataset means torch.as_tensor() on a single example yields
+        rank 2 instead of rank 1, which is exactly the
+        "input_ids rank 2 (expected 1)" schema-validation failure
+        TrainingAgent reported. Squeezing it here, once, at the only place
+        all encoders funnel through, keeps every downstream consumer
+        (TrainingAgent's validator, the Qwen-VL collator, default_data_collator)
+        working with a single consistent per-example rank-1 contract.
+        """
+        for key in ("input_ids", "attention_mask", "labels"):
+            val = entry.get(key)
+            if (
+                isinstance(val, list) and len(val) == 1
+                and isinstance(val[0], list)
+            ):
+                entry[key] = val[0]
+        return entry
 
     # ── Model-specific encoders (unchanged behaviour) ─────────────────────────
 
@@ -489,6 +531,14 @@ class FeatureEngineeringAgent:
                        truncation=True, max_length=max_len)
         result = {k: v for k, v in enc.items()}
         result["labels"] = result.get("input_ids", [])[:]
+        if "image_grid_thw" in result:
+            g = result["image_grid_thw"]
+            # Some processor versions wrap this as [[t,h,w]] (batch-of-one)
+            # instead of [t,h,w] per image — normalize to the flat form so
+            # the qwen_vl_collator's reshape(-1, 3) in TrainingAgent always
+            # receives a consistent shape regardless of processor version.
+            if isinstance(g, list) and len(g) == 1 and isinstance(g[0], list) and isinstance(g[0][0], list):
+                result["image_grid_thw"] = g[0]
         return result
 
     def _encode_phi_vision(self, question, answer, image, processor, max_len) -> Dict:
@@ -546,13 +596,16 @@ class FeatureEngineeringAgent:
         from PIL import Image
         import io
 
-        image_path = rec.get("image_path", "")
+        image_path = (
+            rec.get("image_path") or rec.get("img_path")
+            or rec.get("image_file") or rec.get("file_path") or ""
+        )
         if image_path:
             img = self._load_image(image_path)
             if img is not None:
                 return img
 
-        raw = rec.get("image")
+        raw = rec.get("image", rec.get("img", rec.get("pixel_data")))
         if raw is None:
             return None
 
@@ -567,6 +620,17 @@ class FeatureEngineeringAgent:
                 return None
             if isinstance(raw, (bytes, bytearray)):
                 return Image.open(io.BytesIO(raw)).convert("RGB")
+            if isinstance(raw, str):
+                # Possible base64-encoded image string (with or without a
+                # data: URI prefix) — some preprocessing pipelines serialize
+                # images this way to keep everything in a single JSONL field.
+                import base64
+                s = raw.split(",", 1)[-1] if raw.startswith("data:") else raw
+                try:
+                    decoded = base64.b64decode(s, validate=True)
+                    return Image.open(io.BytesIO(decoded)).convert("RGB")
+                except Exception:
+                    return self._load_image(raw)  # maybe it's actually a path
             # numpy array or similar array-like
             import numpy as np
             if isinstance(raw, np.ndarray):
