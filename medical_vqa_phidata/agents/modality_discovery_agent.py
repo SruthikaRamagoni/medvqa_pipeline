@@ -87,7 +87,11 @@ MODALITY_KEYWORDS: Dict[str, list] = {
 
 # Vision-capable Groq model for the multimodal fallback path.
 # (llama-3.1-8b-instant is text-only and cannot see the image.)
-VISION_MODEL_ID = "llama-3.2-11b-vision-preview"
+# NOTE: llama-3.2-11b-vision-preview has been deprecated/retired by Groq.
+# As of mid-2026 Groq's vision lineup runs on Llama 4 — confirm current
+# availability at https://console.groq.com/docs/vision before deploying,
+# since Groq's hosted-model lineup changes over time.
+VISION_MODEL_ID = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 
 class ModalityDiscoveryAgent:
@@ -328,8 +332,21 @@ class ModalityDiscoveryAgent:
                 response = self.agent.run(prompt)
             return self._parse_response(response, heuristic, heuristic_conf)
         except Exception as e:
-            logger.warning(f"[Modality] LLM call failed: {e}. Using heuristic.")
-            return {"modality": heuristic, "confidence": round(heuristic_conf, 2)}
+            # Important: do NOT silently return the low-confidence heuristic
+            # guess as if the LLM had confirmed it — that's exactly the
+            # "confidently wrong CT" failure mode we're trying to eliminate.
+            # Surface this as Unknown with the error visible in metadata so
+            # the orchestrator / a human reviewer can see the vision call
+            # itself failed, rather than treating "CT, conf=0.25" as a real
+            # decision.
+            logger.warning(f"[Modality] Vision LLM call failed: {e}. Returning Unknown (not heuristic).")
+            return {
+                "modality": "Unknown",
+                "confidence": 0.0,
+                "error": f"vision_llm_failed: {e}",
+                "heuristic_guess": heuristic,
+                "heuristic_confidence": round(heuristic_conf, 2),
+            }
 
     # ── Response parser ───────────────────────────────────────────────────────
 
