@@ -1,33 +1,54 @@
 """
 agents/model_selection_agent.py
 
-ModelSelectionAgent — scores and selects the best open-source VQA model
-architecture based on hardware, dataset size, and modality.
+ModelSelectionAgent — Adaptive model selection for Medical VQA.
 
-RECALL / SELF-HEALING UPDATE
------------------------------
-select_model() now accepts:
-    failed_models : List[str]   — hf_ids to permanently exclude (accumulates
-                                   across retries; TrainingAgent maintains
-                                   this list and passes the full history
-                                   each time, not just the latest failure).
-    failure_reason: str         — free-text error from the most recent
-                                   training attempt. Classified into one of
-                                   a fixed set of failure classes and used to
-                                   penalize/exclude the *entire family* of
-                                   the failed model, not just its exact
-                                   hf_id (e.g. a Qwen-VL tensor-shape error
-                                   excludes all Qwen-VL candidates, since
-                                   the same collator bug would recur).
+COMPATIBILITY CONTRACT
+-----------------------
+Returns a complete model_plan with full compatibility metadata so that
+FeatureEngineeringAgent and TrainingAgent never have to re-derive
+model-family behaviour themselves:
 
-    Backward compatibility: the old `failure_context={"failed_hf_id":...,
-    "reason":...}` calling convention is still accepted and is internally
-    merged into failed_models / failure_reason.
+    {
+        "hf_id", "name", "architecture", "vision",
+        "loader",           # exact HF class to use
+        "model_family",     # canonical family string
+        "processor_type",   # AutoTokenizer | AutoProcessor
+        "feature_strategy", # seq2seq | causal_lm | vision2seq | ...
+        "collator_type",    # DataCollatorForSeq2Seq | default_data_collator
+        "tensor_schema",    # human-readable expected tensor shapes
+        "use_4bit", "precision",
+        "lora_r", "lora_alpha", "lora_dropout", "target_modules",
+        "batch_size", "epochs", "learning_rate", "max_seq_len",
+        "excluded_models",  # passed through for bookkeeping
+    }
 
-Returns a complete compatibility-metadata dict (hf_id, architecture,
-loader, processor_type, vision, feature_strategy, collator_type,
-batch_size, epochs, lora_r, ...) so FeatureEngineeringAgent and
-TrainingAgent never have to re-derive model-family behaviour themselves.
+CALLING CONVENTIONS
+--------------------
+Primary (from main.py — unchanged):
+    select_model(vram_gb, ram_gb, dataset_size, modality, device,
+                 excluded_models=[], failure_reason="")
+
+Alternative (retry-aware, from TrainingAgent):
+    select_model(dataset_size=N, modality="X-Ray",
+                 failed_models=[...], failure_reason="...")
+
+Both are fully supported via flexible kwargs.
+
+FAILURE CLASSES
+----------------
+oom                  → exclude models that still won't fit after cache flush
+tensor_dim_mismatch  → exclude entire fragile vision family
+processor_not_supported → exclude family
+load_error           → exclude exact model only
+training_error       → exclude exact model only
+
+CONSTANTS
+----------
+TEXT_ONLY_FAMILIES          — flan_t5, seq2seq excluded from VQA scoring
+                              (no vision encoder)
+HARDWARE_INCOMPATIBLE_ON_T4 — InstructBLIP >= 7B excluded on < 16 GB VRAM
+TENSOR_FRAGILE_FAMILIES     — families prone to dimension mismatches
 """
 
 from phi.agent import Agent
@@ -42,27 +63,109 @@ from config.settings import MODEL_CATALOGUE
 
 logger = logging.getLogger(__name__)
 
+# ── Constants ─────────────────────────────────────────────────────────────────
 
-# Canonical failure classes used for family-level penalization.
-FAILURE_CLASSES = ("oom", "load_error", "tensor_dim_mismatch",
-                    "processor_not_supported", "training_error")
+FAILURE_CLASSES = (
+    "oom", "load_error", "tensor_dim_mismatch",
+    "processor_not_supported", "training_error",
+)
 
-# Families whose collator/processor pipeline is most exposed to a
-# tensor-dimension mismatch (ragged pixel_values / stray leading dims).
-TENSOR_FRAGILE_FAMILIES = {"qwen_vl", "blip2", "instructblip", "llava", "phi_vision"}
+TENSOR_FRAGILE_FAMILIES = {
+    "qwen_vl", "blip2", "instructblip", "llava", "phi_vision",
+}
 
-# Text-only families — no vision encoder, always invalid for VQA tasks.
 TEXT_ONLY_FAMILIES = {"flan_t5", "seq2seq"}
+
+HARDWARE_INCOMPATIBLE_ON_T4 = {
+    "Salesforce/instructblip-vicuna-7b",
+    "Salesforce/instructblip-flan-t5-xxl",
+}
+
+# Full compatibility table: family → loader, processor, strategy, collator, schema
+_COMPAT_TABLE: Dict[str, Dict[str, str]] = {
+    "flan_t5": dict(
+        loader="AutoModelForSeq2SeqLM",
+        processor_type="AutoTokenizer",
+        feature_strategy="seq2seq",
+        collator_type="DataCollatorForSeq2Seq",
+        tensor_schema="input_ids[b,s], attention_mask[b,s], labels[b,s]",
+    ),
+    "seq2seq": dict(
+        loader="AutoModelForSeq2SeqLM",
+        processor_type="AutoTokenizer",
+        feature_strategy="seq2seq",
+        collator_type="DataCollatorForSeq2Seq",
+        tensor_schema="input_ids[b,s], attention_mask[b,s], labels[b,s]",
+    ),
+    "causal": dict(
+        loader="AutoModelForCausalLM",
+        processor_type="AutoTokenizer",
+        feature_strategy="causal_lm",
+        collator_type="default_data_collator",
+        tensor_schema="input_ids[b,s], labels[b,s]",
+    ),
+    "blip2": dict(
+        loader="Blip2ForConditionalGeneration",
+        processor_type="AutoProcessor",
+        feature_strategy="vision2seq",
+        collator_type="default_data_collator",
+        tensor_schema="pixel_values[b,3,224,224], input_ids[b,s], labels[b,s]",
+    ),
+    "instructblip": dict(
+        loader="InstructBlipForConditionalGeneration",
+        processor_type="AutoProcessor",
+        feature_strategy="vision2seq",
+        collator_type="default_data_collator",
+        tensor_schema="pixel_values[b,3,224,224], input_ids[b,s], labels[b,s]",
+    ),
+    "llava": dict(
+        loader="AutoModelForImageTextToText",
+        processor_type="AutoProcessor",
+        feature_strategy="vision2seq",
+        collator_type="default_data_collator",
+        tensor_schema="pixel_values[b,3,H,W], input_ids[b,s], labels[b,s]",
+    ),
+    "qwen_vl": dict(
+        loader="AutoModelForVision2Seq",           # resolved per hf_id at runtime
+        processor_type="AutoProcessor",
+        feature_strategy="vision2seq_patchified",
+        collator_type="qwen_vl_collator",
+        tensor_schema=(
+            "pixel_values[total_patches,patch_dim], "
+            "image_grid_thw[n_img,3], input_ids[b,s], labels[b,s]"
+        ),
+    ),
+    "phi_vision": dict(
+        loader="AutoModelForCausalLM",
+        processor_type="AutoProcessor",
+        feature_strategy="vision2seq",
+        collator_type="default_data_collator",
+        tensor_schema="pixel_values[b,3,H,W], input_ids[b,s], labels[b,s]",
+    ),
+    "idefics": dict(
+        loader="AutoModelForImageTextToText",
+        processor_type="AutoProcessor",
+        feature_strategy="vision2seq",
+        collator_type="default_data_collator",
+        tensor_schema="pixel_values[b,3,H,W], input_ids[b,s], labels[b,s]",
+    ),
+}
 
 
 class ModelSelectionAgent:
     """
-    Selects the best model for Medical VQA training based on
-    GPU VRAM, dataset size, and imaging modality.
+    Selects the best model for Medical VQA training.
 
-    Supports retry-aware selection: pass `failed_models` (+ `failure_reason`)
-    on subsequent calls so the agent avoids the models — and model
-    *families* — that caused previous training failures.
+    Supports two calling conventions (both accepted):
+      1. main.py style:
+            select_model(vram_gb=..., ram_gb=..., dataset_size=...,
+                         modality=..., device=...,
+                         excluded_models=[...], failure_reason="...")
+      2. Retry style (from TrainingAgent):
+            select_model(dataset_size=..., modality=...,
+                         failed_models=[...], failure_reason="...")
+
+    Both return the same complete model_plan dict.
     """
 
     def __init__(self, model_id: str = "mistral"):
@@ -70,107 +173,114 @@ class ModelSelectionAgent:
             name="ModelSelectionAgent",
             model=Groq(id="llama-3.1-8b-instant"),
             instructions=[
-                "You are a machine learning model selection expert.",
-                "Select the best vision-language model for Medical VQA fine-tuning.",
-                "Prefer vision models when VRAM allows.",
-                "If previous models failed, never pick them or models from the "
-                "same architecture family again, and explain why the "
-                "alternative is safer.",
-                "Always reply with ONLY a JSON object containing "
-                "'selected_model_hf_id', 'model_name', and 'reason'.",
-                "Do not write code. Do not add any text outside the JSON.",
+                "You are a machine learning model selection expert for Medical VQA.",
+                "Select the best vision-language model given hardware and dataset constraints.",
+                "Only choose models that can ACTUALLY run on the given hardware.",
+                "On CPU (VRAM=0): only choose text-only models (Flan-T5).",
+                "If previous models failed, NEVER pick them or models from the same "
+                "architecture family again when the failure looks structural.",
+                "Always reply with ONLY a JSON object: "
+                '{"selected_model_hf_id": "<hf_id>", '
+                '"model_name": "<name>", "reason": "<one sentence>"}',
+                "Do not write code. No text outside the JSON.",
             ],
             show_tool_calls=False,
             markdown=False,
         )
 
-    # ── Public ────────────────────────────────────────────────────────────────
+    # ── Public interface ──────────────────────────────────────────────────────
 
     def select_model(
         self,
-        dataset_size: int,
-        modality:     str,
-        failed_models: Optional[List[str]] = None,
-        failure_reason: str = "",
-        failure_context: Optional[Dict[str, Any]] = None,  # back-compat
+        # ── main.py calling convention ────────────────────────────────────────
+        vram_gb:          Optional[float]      = None,
+        ram_gb:           Optional[float]      = None,
+        dataset_size:     int                  = 1000,
+        modality:         str                  = "",
+        device:           Optional[str]        = None,
+        # ── retry / recovery calling convention ──────────────────────────────
+        failed_models:    Optional[List[str]]  = None,   # alias: excluded_models
+        failure_reason:   str                  = "",
+        # ── back-compat ───────────────────────────────────────────────────────
+        excluded_models:  Optional[List[str]]  = None,   # synonym for failed_models
+        failure_context:  Optional[Dict]       = None,   # legacy single-failure dict
     ) -> Dict[str, Any]:
         """
-        Auto-detect resources, score all candidate models, and return
-        a complete model_plan dict with full compatibility metadata.
-
-        Args:
-            dataset_size    : Number of training samples.
-            modality        : Imaging modality string (e.g. 'X-Ray').
-            failed_models   : hf_ids to exclude (accumulated failure history).
-            failure_reason  : Free-text error from the most recent failure.
-            failure_context : Deprecated single-failure dict
-                               {"failed_hf_id": ..., "reason": ...}.
-                               Merged into failed_models/failure_reason.
-
-        Returns:
-            model_plan dict — see module docstring.
+        Select the best feasible model. Auto-detects hardware if vram_gb /
+        ram_gb / device are not provided (retry-aware mode).
         """
-        failed_models = list(failed_models or [])
-
-        # Merge deprecated single-failure calling convention
+        # ── Normalise excluded list ───────────────────────────────────────────
+        all_excluded: List[str] = []
+        if failed_models:
+            all_excluded.extend(failed_models)
+        if excluded_models:
+            all_excluded.extend(excluded_models)
         if failure_context:
             fid = failure_context.get("failed_hf_id", "")
-            if fid and fid not in failed_models:
-                failed_models.append(fid)
+            if fid and fid not in all_excluded:
+                all_excluded.append(fid)
             failure_reason = failure_reason or failure_context.get("reason", "")
 
-        failure_class = self._infer_failure_class(failure_reason) if failure_reason else ""
-        failed_families = {
-            self._detect_model_family(fid) for fid in failed_models
-        }
+        failure_class   = self._infer_failure_class(failure_reason)
+        failed_families = {self._detect_family(fid) for fid in all_excluded}
 
-        # CHANGE 2: flush GPU cache and use total VRAM when retrying after OOM
-        resources = self._detect_resources(flush=(failure_class == "oom"))
-        device    = resources["device"]
-        vram_gb   = resources["vram_gb"]
-        ram_gb    = resources["ram_gb"]
+        # ── Resolve hardware ──────────────────────────────────────────────────
+        flush_cache = (failure_class == "oom")
+        hw = self._detect_resources(flush=flush_cache)
 
-        if failure_reason:
-            logger.info(
-                f"[ModelSelection] Retry mode — excluded={failed_models} "
-                f"failure_class={failure_class} failed_families={failed_families}"
-            )
+        resolved_device  = device  if device  is not None else hw["device"]
+        resolved_vram_gb = vram_gb if vram_gb is not None else hw["vram_gb"]
+        resolved_ram_gb  = ram_gb  if ram_gb  is not None else hw["ram_gb"]
 
+        logger.info(
+            f"[ModelSelection] device={resolved_device}  "
+            f"VRAM={resolved_vram_gb:.1f}GB  RAM={resolved_ram_gb:.1f}GB  "
+            f"dataset={dataset_size}  excluded={all_excluded}  "
+            f"failure_class={failure_class}"
+        )
+
+        # ── Score candidates ──────────────────────────────────────────────────
         scored = self._score_models(
-            vram_gb, device, dataset_size,
-            failed_models=failed_models,
+            vram_gb=resolved_vram_gb,
+            device=resolved_device,
+            dataset_size=dataset_size,
+            failed_models=all_excluded,
             failure_class=failure_class,
             failed_families=failed_families,
         )
-        if not scored:
-            # Last-resort fallback: cheapest vision model available.
-            # flan_t5 / seq2seq are excluded from VQA so we don't use them here.
-            scored = [MODEL_CATALOGUE[0]]
 
+        if not scored:
+            logger.warning("[ModelSelection] No feasible models. Using absolute fallback.")
+            return self._absolute_fallback(resolved_device, dataset_size, all_excluded)
+
+        # ── Groq LLM confirmation ─────────────────────────────────────────────
         top3_summary = "\n".join(
             f"{i+1}. {m['name']} | hf_id={m['hf_id']} | "
-            f"vision={m['vision']} | params={m['params_b']}B | quality={m['quality']}"
+            f"vision={m['vision']} | params={m['params_b']}B | "
+            f"score={m['_score']:.2f}"
             for i, m in enumerate(scored[:3])
         )
 
         failure_clause = ""
-        if failed_models:
+        if all_excluded:
             failure_clause = (
-                f"\nIMPORTANT: These models already failed and must NOT be "
-                f"reselected: {failed_models}\n"
+                f"\nIMPORTANT: These models already FAILED — do not re-select them: "
+                f"{all_excluded}\n"
                 f"Failure reason: {failure_reason}\n"
-                f"Choose a model from a DIFFERENT architecture family if the "
-                f"failure looks structural (tensor shape / processor issues).\n"
+                f"Choose a different architecture family if failure looks structural.\n"
             )
 
         prompt = (
             f"Select the best model for Medical Visual Question Answering.\n"
-            f"Hardware: device={device}  VRAM={vram_gb:.1f}GB  RAM={ram_gb:.1f}GB\n"
-            f"Dataset:  {dataset_size} samples  modality={modality}\n"
+            f"Hardware: device={resolved_device}  VRAM={resolved_vram_gb:.1f}GB  "
+            f"RAM={resolved_ram_gb:.1f}GB\n"
+            f"Dataset: {dataset_size} samples  modality={modality}\n"
             f"{failure_clause}\n"
-            f"Top candidates:\n{top3_summary}\n\n"
-            f"Pick the model that best balances quality and hardware fit.\n"
-            f"Prefer vision models when VRAM >= 4 GB.\n\n"
+            f"Top feasible candidates:\n{top3_summary}\n\n"
+            f"Rules:\n"
+            f"- On CPU (VRAM=0): only pick Flan-T5 (text-only).\n"
+            f"- Prefer vision models when VRAM >= 4 GB.\n"
+            f"- After tensor-shape or processor failure: pick a different family.\n"
             f'Reply with ONLY: {{"selected_model_hf_id": "<hf_id>", '
             f'"model_name": "<name>", "reason": "<one sentence>"}}'
         )
@@ -178,77 +288,58 @@ class ModelSelectionAgent:
         response  = self.agent.run(prompt)
         llm_hf_id = self._parse_response(response)
 
-        best = scored[0]
-        if llm_hf_id and llm_hf_id.lower() not in [f.lower() for f in failed_models]:
-            for m in MODEL_CATALOGUE:
+        best = scored[0]  # default to top-scored
+        if llm_hf_id and llm_hf_id.lower() not in [f.lower() for f in all_excluded]:
+            for m in scored:
                 if llm_hf_id.lower() in m["hf_id"].lower():
-                    m_family = self._detect_model_family(m["hf_id"])
-                    if m_family not in failed_families and m_family not in TEXT_ONLY_FAMILIES:
+                    fam = self._detect_family(m["hf_id"])
+                    # Guard: never let LLM pick a text-only or HW-incompatible model
+                    if (fam not in TEXT_ONLY_FAMILIES
+                            and not (m["hf_id"] in HARDWARE_INCOMPATIBLE_ON_T4
+                                     and resolved_vram_gb < 16.0)):
                         best = m
+                        logger.info(f"[ModelSelection] LLM confirmed: {m['name']}")
                     break
 
-        use_4bit = (vram_gb < best["min_vram"]) and (device == "cuda")
-        family   = self._detect_model_family(best["hf_id"])
-        compat   = self._compat_metadata(family, best["hf_id"])
-
-        plan = {
-            # Identity
-            "hf_id":          best["hf_id"],
-            "name":           best["name"],
-            "architecture":   best["architecture"],
-            "vision":         best["vision"],
-            "loader":         compat["loader"],
-
-            # Compatibility metadata (consumed by FeatureEngineeringAgent /
-            # TrainingAgent so they never have to re-derive family behaviour)
-            "model_family":      family,
-            "processor_type":    compat["processor_type"],
-            "feature_strategy":  compat["feature_strategy"],
-            "collator_type":     compat["collator_type"],
-            "tensor_schema":     compat["tensor_schema"],
-
-            # Hardware
-            "use_4bit":       use_4bit,
-            "precision":      "fp32" if device == "cpu" else "fp16",
-
-            # LoRA
-            "lora_r":         8  if dataset_size < 1000 else 16,
-            "lora_alpha":     16 if dataset_size < 1000 else 32,
-            "lora_dropout":   0.05,
-            "target_modules": best["target_modules"],
-
-            # Training
-            "batch_size":     1 if device == "cpu" else (2 if use_4bit else 4),
-            "epochs":         5 if dataset_size < 500 else 3,
-            "learning_rate":  2e-4,
-
-            # Feature engineering
-            "max_seq_len":    128,
-
-            # Retry bookkeeping
-            "excluded_models": failed_models,
-            "_selected_reason": "",
-        }
-
-        try:
-            text = response.content if hasattr(response, "content") else str(response)
-            match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-            if match:
-                plan["_selected_reason"] = json.loads(match.group()).get("reason", "")
-        except Exception:
-            pass
-
-        logger.info(
-            f"[ModelSelection] Selected: {plan['hf_id']} family={family} "
-            f"(4bit={use_4bit}) reason={plan['_selected_reason']}"
+        return self._build_plan(
+            best, resolved_vram_gb, resolved_device, dataset_size,
+            all_excluded, response
         )
-        return plan
 
-    # ── Resource detection ────────────────────────────────────────────────────
+    # ── Backward-compat wrapper for TrainingAgent ─────────────────────────────
+
+    def reselect_after_failure(
+        self,
+        failed_hf_id:        str,
+        failure_reason:      str,
+        vram_gb:             float,
+        ram_gb:              float,
+        dataset_size:        int,
+        modality:            str,
+        device:              str,
+        previously_excluded: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Convenience wrapper — calls select_model with failure context."""
+        excluded = list(previously_excluded or [])
+        if failed_hf_id not in excluded:
+            excluded.append(failed_hf_id)
+        return self.select_model(
+            vram_gb=vram_gb,
+            ram_gb=ram_gb,
+            dataset_size=dataset_size,
+            modality=modality,
+            device=device,
+            failed_models=excluded,
+            failure_reason=failure_reason,
+        )
+
+    # ── Hardware detection ────────────────────────────────────────────────────
 
     def _detect_resources(self, flush: bool = False) -> Dict[str, Any]:
-        # CHANGE 1: flush=True clears GPU cache and reports total VRAM (not
-        # total-reserved), so an OOM retry sees 14.6 GB instead of 0.1 GB.
+        """
+        flush=True: empty GPU cache first and report total VRAM
+        (not total-reserved), so OOM retries see the full budget.
+        """
         import psutil
         ram_gb = psutil.virtual_memory().total / (1024 ** 3)
         try:
@@ -256,173 +347,229 @@ class ModelSelectionAgent:
             if torch.cuda.is_available():
                 if flush:
                     torch.cuda.empty_cache()
-                device            = "cuda"
-                vram_gb           = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-                reserved_gb       = torch.cuda.memory_reserved(0) / (1024 ** 3)
-                vram_available_gb = vram_gb if flush else (vram_gb - reserved_gb)
-                gpu_name          = torch.cuda.get_device_name(0)
+                props   = torch.cuda.get_device_properties(0)
+                total   = props.total_memory / (1024 ** 3)
+                reserved= torch.cuda.memory_reserved(0) / (1024 ** 3)
+                vram    = total if flush else max(total - reserved, 0.0)
                 logger.info(
-                    f"GPU detected: {gpu_name} | Total VRAM: {vram_gb:.1f}GB | "
-                    f"Available: {vram_available_gb:.1f}GB"
+                    f"[ModelSelection] GPU: {props.name} | "
+                    f"Total={total:.1f}GB | Available={vram:.1f}GB"
                 )
-            else:
-                device            = "cpu"
-                vram_available_gb = 0.0
-                logger.info("No GPU detected, using CPU.")
+                return {"device": "cuda", "vram_gb": vram, "ram_gb": ram_gb}
+            elif torch.backends.mps.is_available():
+                return {"device": "mps", "vram_gb": ram_gb * 0.5, "ram_gb": ram_gb}
         except Exception as e:
-            logger.warning(f"Could not detect GPU: {e}. Falling back to CPU.")
-            device            = "cpu"
-            vram_available_gb = 0.0
+            logger.warning(f"[ModelSelection] GPU detection failed: {e}")
+        return {"device": "cpu", "vram_gb": 0.0, "ram_gb": ram_gb}
 
-        logger.info(f"RAM available: {ram_gb:.1f}GB | Device: {device}")
-        return {"device": device, "vram_gb": vram_available_gb, "ram_gb": ram_gb}
+    # ── Family detection ──────────────────────────────────────────────────────
 
-    # ── Family detection (shared vocabulary with FeatureEngineeringAgent) ─────
-
-    def _detect_model_family(self, hf_id: str) -> str:
+    def _detect_family(self, hf_id: str) -> str:
+        """
+        Canonical model-family string.
+        Shared vocabulary with FeatureEngineeringAgent and TrainingAgent.
+        """
         hid = (hf_id or "").lower()
-        if "flan-t5" in hid or "flan_t5" in hid:          return "flan_t5"
-        if "blip2" in hid or "blip-2" in hid:             return "blip2"
-        if "instructblip" in hid:                          return "instructblip"
-        if "llava" in hid:                                 return "llava"
-        if "qwen2.5-vl" in hid or "qwen2-vl" in hid:      return "qwen_vl"
-        if "phi-3.5-vision" in hid or "phi3.5" in hid:    return "phi_vision"
-        if "idefics" in hid:                               return "idefics"
-        if "t5" in hid:                                    return "seq2seq"
-        if "bart" in hid:                                  return "seq2seq"
+        if "flan-t5" in hid or "flan_t5" in hid:        return "flan_t5"
+        if "blip2"   in hid or "blip-2"  in hid:        return "blip2"
+        if "instructblip" in hid:                        return "instructblip"
+        if "llava"        in hid:                        return "llava"
+        if "qwen2.5-vl"   in hid or "qwen2-vl" in hid:  return "qwen_vl"
+        if "phi-3.5-vision" in hid or "phi3.5"  in hid: return "phi_vision"
+        if "idefics"      in hid:                        return "idefics"
+        if "t5"  in hid:                                 return "seq2seq"
+        if "bart" in hid:                                return "seq2seq"
         return "causal"
 
-    # ── Compatibility metadata per family ──────────────────────────────────────
+    # ── Compatibility metadata ────────────────────────────────────────────────
 
     def _compat_metadata(self, family: str, hf_id: str = "") -> Dict[str, str]:
-        table = {
-            "flan_t5":       dict(loader="AutoModelForSeq2SeqLM",
-                                   processor_type="AutoTokenizer",
-                                   feature_strategy="seq2seq",
-                                   collator_type="DataCollatorForSeq2Seq",
-                                   tensor_schema="input_ids[b,s], attention_mask[b,s], labels[b,s]"),
-            "seq2seq":       dict(loader="AutoModelForSeq2SeqLM",
-                                   processor_type="AutoTokenizer",
-                                   feature_strategy="seq2seq",
-                                   collator_type="DataCollatorForSeq2Seq",
-                                   tensor_schema="input_ids[b,s], attention_mask[b,s], labels[b,s]"),
-            "causal":        dict(loader="AutoModelForCausalLM",
-                                   processor_type="AutoTokenizer",
-                                   feature_strategy="causal_lm",
-                                   collator_type="default_data_collator",
-                                   tensor_schema="input_ids[b,s], labels[b,s]"),
-            "blip2":         dict(loader="Blip2ForConditionalGeneration",
-                                   processor_type="AutoProcessor",
-                                   feature_strategy="vision2seq",
-                                   collator_type="default_data_collator",
-                                   tensor_schema="pixel_values[b,3,224,224], input_ids[b,s], labels[b,s]"),
-            "instructblip":  dict(loader="InstructBlipForConditionalGeneration",
-                                   processor_type="AutoProcessor",
-                                   feature_strategy="vision2seq",
-                                   collator_type="default_data_collator",
-                                   tensor_schema="pixel_values[b,3,224,224], input_ids[b,s], labels[b,s]"),
-            "llava":         dict(loader="AutoModelForImageTextToText",
-                                   processor_type="AutoProcessor",
-                                   feature_strategy="vision2seq",
-                                   collator_type="default_data_collator",
-                                   tensor_schema="pixel_values[b,3,H,W], input_ids[b,s], labels[b,s]"),
-            "qwen_vl":       dict(loader=(
-                                       "Qwen2_5_VLForConditionalGeneration"
-                                       if "qwen2.5-vl" in hf_id.lower()
-                                       else "Qwen2VLForConditionalGeneration"
-                                   ),
-                                   processor_type="AutoProcessor",
-                                   feature_strategy="vision2seq_patchified",
-                                   collator_type="qwen_vl_collator",
-                                   tensor_schema="pixel_values[total_patches,patch_dim], image_grid_thw[n_img,3], input_ids[b,s], labels[b,s]"),
-            "phi_vision":    dict(loader="AutoModelForCausalLM",
-                                   processor_type="AutoProcessor",
-                                   feature_strategy="vision2seq",
-                                   collator_type="default_data_collator",
-                                   tensor_schema="pixel_values[b,3,H,W], input_ids[b,s], labels[b,s]"),
-            "idefics":       dict(loader="AutoModelForImageTextToText",
-                                   processor_type="AutoProcessor",
-                                   feature_strategy="vision2seq",
-                                   collator_type="default_data_collator",
-                                   tensor_schema="pixel_values[b,3,H,W], input_ids[b,s], labels[b,s]"),
-        }
-        return table.get(family, table["causal"])
+        meta = dict(_COMPAT_TABLE.get(family, _COMPAT_TABLE["causal"]))
+        # Resolve exact Qwen loader
+        if family == "qwen_vl":
+            if "qwen2.5-vl" in hf_id.lower():
+                meta["loader"] = "Qwen2_5_VLForConditionalGeneration"
+            else:
+                meta["loader"] = "Qwen2VLForConditionalGeneration"
+        return meta
 
     # ── Scoring ───────────────────────────────────────────────────────────────
 
     def _score_models(
         self,
-        vram_gb:        float,
-        device:         str,
-        dataset_size:   int,
-        failed_models:  List[str],
-        failure_class:  str = "",
-        failed_families: Optional[set] = None,
+        vram_gb:         float,
+        device:          str,
+        dataset_size:    int,
+        failed_models:   List[str],
+        failure_class:   str,
+        failed_families: set,
     ) -> List[Dict]:
-        failed_models   = [f.lower() for f in failed_models]
-        failed_families = failed_families or set()
+        excluded_lower = {f.lower() for f in failed_models}
+        feasible       = []
 
-        feasible = []
         for m in MODEL_CATALOGUE:
-            if m["hf_id"].lower() in failed_models:
-                logger.debug(f"[ModelSelection] Excluded (prev failure): {m['hf_id']}")
+            # Exact exclusions
+            if m["hf_id"].lower() in excluded_lower:
                 continue
 
-            m_family = self._detect_model_family(m["hf_id"])
+            family = self._detect_family(m["hf_id"])
 
-            # CHANGE 3: text-only families have no vision encoder — always
-            # invalid for VQA regardless of VRAM or failure class.
-            if m_family in TEXT_ONLY_FAMILIES:
-                logger.debug(
-                    f"[ModelSelection] Excluded (text-only, no vision encoder): "
-                    f"{m['hf_id']} [{m_family}]"
-                )
+            # Never score text-only for vision VQA
+            if family in TEXT_ONLY_FAMILIES:
                 continue
 
-            # Structural failure classes (tensor-shape / processor issues)
-            # exclude the WHOLE family, not just the exact failed model,
-            # since the bug is architectural, not weight-specific.
+            # Hardware-incompatible on T4
+            if (m["hf_id"] in HARDWARE_INCOMPATIBLE_ON_T4
+                    and device == "cuda" and vram_gb < 16.0):
+                continue
+
+            # Family-level exclusion for structural failures
             if failure_class in ("tensor_dim_mismatch", "processor_not_supported"):
-                if m_family in failed_families and m_family in TENSOR_FRAGILE_FAMILIES:
-                    logger.debug(
-                        f"[ModelSelection] Excluded (family-level, "
-                        f"{failure_class}): {m['hf_id']} [{m_family}]"
-                    )
+                if family in failed_families and family in TENSOR_FRAGILE_FAMILIES:
                     continue
 
+            # OOM: apply headroom buffer
             if failure_class == "oom" and device == "cuda":
-                safe_vram = vram_gb * 0.85
-                if m["min_vram"] > safe_vram and m["min_vram_4bit"] > safe_vram:
-                    logger.debug(f"[ModelSelection] Excluded (OOM headroom): {m['hf_id']}")
+                safe = vram_gb * 0.85
+                if m["min_vram"] > safe and m.get("min_vram_4bit", 0) > safe:
                     continue
 
-            ok = (
-                True if device == "cpu"
-                else (vram_gb >= m["min_vram"] or vram_gb >= m["min_vram_4bit"])
-            )
-            if not ok:
+            # Hardware feasibility
+            if device == "cuda":
+                fits = vram_gb >= m["min_vram"] or vram_gb >= m.get("min_vram_4bit", 0)
+            elif device == "cpu":
+                fits = True
+            else:
+                fits = True
+
+            if not fits:
                 continue
 
-            score = m["quality"]
-            if dataset_size < 500 and m["params_b"] > 7:
+            score = float(m.get("quality", 0.5))
+            if dataset_size < 500 and m.get("params_b", 0) > 7:
                 score *= 0.8
-            if m_family in failed_families:
-                score *= 0.5  # soft penalty even for non-structural failures
+            if family in failed_families:
+                score *= 0.5          # soft-penalise same family
 
-            feasible.append({**m, "_score": score})
+            feasible.append({**m, "_score": score, "_family": family})
 
         return sorted(feasible, key=lambda x: x["_score"], reverse=True)
+
+    # ── Plan builder ──────────────────────────────────────────────────────────
+
+    def _build_plan(
+        self,
+        best:         Dict,
+        vram_gb:      float,
+        device:       str,
+        dataset_size: int,
+        excluded:     List[str],
+        response,
+    ) -> Dict[str, Any]:
+        family  = self._detect_family(best["hf_id"])
+        compat  = self._compat_metadata(family, best["hf_id"])
+        params_b= float(best.get("params_b", 0))
+
+        # 4-bit logic: large models on T4, never on CPU
+        if device == "cuda" and vram_gb < 16.0:
+            use_4bit = params_b > 3.0
+        elif device == "cuda":
+            use_4bit = vram_gb < best.get("min_vram", 99)
+        else:
+            use_4bit = False
+
+        # Adaptive hyperparams
+        if   dataset_size < 200:  lora_r, lora_a, epochs, batch = 4,  8,  5, 1
+        elif dataset_size < 1000: lora_r, lora_a, epochs, batch = 8,  16, 5, 2
+        else:                     lora_r, lora_a, epochs, batch = 16, 32, 3, 2 if use_4bit else 4
+        if device == "cpu":       batch = 1
+
+        # Parse LLM reason
+        reason = ""
+        try:
+            text  = response.content if hasattr(response, "content") else str(response)
+            match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+            if match:
+                reason = json.loads(match.group()).get("reason", "")
+        except Exception:
+            pass
+
+        plan = {
+            # ── Identity ──────────────────────────────────────────────────────
+            "hf_id":             best["hf_id"],
+            "name":              best["name"],
+            "architecture":      best.get("architecture", "causal"),
+            "vision":            best.get("vision", False),
+            # ── Compatibility contract ────────────────────────────────────────
+            "loader":            compat["loader"],
+            "model_family":      family,
+            "processor_type":    compat["processor_type"],
+            "feature_strategy":  compat["feature_strategy"],
+            "collator_type":     compat["collator_type"],
+            "tensor_schema":     compat["tensor_schema"],
+            # ── Hardware ──────────────────────────────────────────────────────
+            "use_4bit":          use_4bit,
+            "precision":         "fp32" if device == "cpu" else "fp16",
+            # ── LoRA ──────────────────────────────────────────────────────────
+            "lora_r":            lora_r,
+            "lora_alpha":        lora_a,
+            "lora_dropout":      0.05,
+            "target_modules":    best.get("target_modules", ["q", "v"]),
+            # ── Training ──────────────────────────────────────────────────────
+            "batch_size":        batch,
+            "epochs":            epochs,
+            "learning_rate":     2e-4,
+            # ── Feature engineering ───────────────────────────────────────────
+            "max_seq_len":       128,
+            # ── Bookkeeping ───────────────────────────────────────────────────
+            "excluded_models":   excluded,
+            "_selected_reason":  reason,
+        }
+
+        logger.info(
+            f"[ModelSelection] -> {plan['hf_id']} | family={family} | "
+            f"4bit={use_4bit} | strategy={compat['feature_strategy']} | "
+            f"collator={compat['collator_type']}"
+        )
+        return plan
+
+    # ── Absolute fallback ─────────────────────────────────────────────────────
+
+    def _absolute_fallback(
+        self, device: str, dataset_size: int, excluded: List[str]
+    ) -> Dict[str, Any]:
+        """
+        Last resort: try Qwen2-VL-2B first (GPU), then Flan-T5-Base (CPU/any).
+        This is the one place where a text-only model is acceptable —
+        because having any answer is better than pipeline failure.
+        """
+        excluded_lower = {e.lower() for e in excluded}
+
+        # Try Qwen2-VL-2B on GPU first
+        if device != "cpu":
+            for m in MODEL_CATALOGUE:
+                if ("qwen2-vl-2b" in m["hf_id"].lower()
+                        and m["hf_id"].lower() not in excluded_lower):
+                    logger.warning(f"[ModelSelection] Fallback to {m['name']}")
+                    return self._build_plan(m, 0.0, device, dataset_size, excluded, "")
+
+        # CPU / last resort: Flan-T5-Base
+        for m in MODEL_CATALOGUE:
+            if ("flan-t5-base" in m["hf_id"].lower()
+                    and m["hf_id"].lower() not in excluded_lower):
+                logger.warning(f"[ModelSelection] Absolute fallback to {m['name']}")
+                return self._build_plan(m, 0.0, device, dataset_size, excluded, "")
+
+        # If Flan-T5 also excluded, just take first available
+        for m in MODEL_CATALOGUE:
+            if m["hf_id"].lower() not in excluded_lower:
+                return self._build_plan(m, 0.0, device, dataset_size, excluded, "")
+
+        raise RuntimeError("[ModelSelection] All models excluded — cannot continue.")
 
     # ── Failure classification ────────────────────────────────────────────────
 
     def _infer_failure_class(self, reason: str) -> str:
-        """
-        Maps free-text / structured failure_reason strings onto one of:
-          oom | load_error | tensor_dim_mismatch | processor_not_supported |
-          training_error
-        Accepts both human-written errors and the short canonical codes
-        TrainingAgent emits (e.g. "tensor_dim_mismatch").
-        """
         r = (reason or "").lower()
         if r in FAILURE_CLASSES:
             return r
@@ -436,7 +583,7 @@ class ModelSelectionAgent:
                                  "processor_not_supported")):
             return "processor_not_supported"
         if any(k in r for k in ("failed to load", "cannot load", "no module",
-                                 "not found in transformers", "weight", "checkpoint")):
+                                 "not found in transformers", "weight")):
             return "load_error"
         return "training_error"
 
@@ -453,19 +600,42 @@ class ModelSelectionAgent:
         return ""
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="[%(asctime)s][%(levelname)s] %(message)s")
-    agent = ModelSelectionAgent()
+# ── Standalone test ───────────────────────────────────────────────────────────
 
-    print("=== Normal selection ===")
-    result = agent.select_model(dataset_size=3515, modality="X-Ray")
-    print(json.dumps(result, indent=2, default=str))
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s][%(levelname)s] %(message)s",
+    )
+    import torch
+
+    agent   = ModelSelectionAgent()
+    device  = "cuda" if torch.cuda.is_available() else "cpu"
+    vram_gb = 0.0
+    if device == "cuda":
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"GPU   : {torch.cuda.get_device_name(0)}")
+    print(f"Device: {device}  VRAM: {vram_gb:.1f}GB\n")
+
+    print("=== main.py calling convention ===")
+    plan = agent.select_model(
+        vram_gb=vram_gb, ram_gb=32.0, dataset_size=2244,
+        modality="X-Ray", device=device,
+    )
+    print(json.dumps(plan, indent=2))
 
     print("\n=== Retry after tensor_dim_mismatch ===")
-    result2 = agent.select_model(
-        dataset_size=3515,
-        modality="X-Ray",
-        failed_models=[result["hf_id"]],
-        failure_reason="tensor_dim_mismatch",
+    plan2 = agent.select_model(
+        dataset_size=2244, modality="X-Ray",
+        failed_models=[plan["hf_id"]],
+        failure_reason="Tensors must have same number of dimensions: got 2 and 3",
     )
-    print(json.dumps(result2, indent=2, default=str))
+    print(json.dumps(plan2, indent=2))
+
+    print("\n=== Retry after OOM ===")
+    plan3 = agent.select_model(
+        dataset_size=2244, modality="X-Ray",
+        failed_models=[plan["hf_id"], plan2["hf_id"]],
+        failure_reason="CUDA out of memory",
+    )
+    print(json.dumps(plan3, indent=2))
