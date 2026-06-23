@@ -79,6 +79,10 @@ from typing import Any, Dict, List, Optional, Tuple
 import json, logging, re
 from pathlib import Path
 
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config.settings import MODEL_CATALOGUE
+
 logger = logging.getLogger(__name__)
 
 CHECKPOINT_DIR = Path("./artifacts/checkpoints")
@@ -208,8 +212,6 @@ class TrainingAgent:
                 f"{failed_models}, reason={canonical_reason}"
             )
             try:
-                import sys
-                sys.path.insert(0, str(Path(__file__).parent.parent))
                 from agents.model_selection_agent import ModelSelectionAgent
 
                 selector = ModelSelectionAgent()
@@ -380,8 +382,6 @@ class TrainingAgent:
     ) -> Dict[str, Any]:
         """Fallback: encode inline, then delegate to the full retry-aware train()."""
         logger.info("[Training] No feature_path provided. Running inline encoding …")
-        import sys
-        sys.path.insert(0, str(Path(__file__).parent.parent))
         from agents.feature_engineering_agent import FeatureEngineeringAgent
 
         fe_agent  = FeatureEngineeringAgent()
@@ -508,7 +508,7 @@ class TrainingAgent:
         except Exception:
             pass
 
-        # ── Unmasked-labels fast-fail (NEW) ─────────────────────────────────
+        # ── Unmasked-labels fast-fail ────────────────────────────────────────
         # Check a small sample of examples, not just one — a single example
         # could coincidentally have its answer span cover (almost) the
         # whole sequence. Checking several makes a false positive unlikely
@@ -553,7 +553,7 @@ class TrainingAgent:
 
         return ""
 
-    # ── Helpers (unchanged from previous version) ────────────────────────────
+    # ── Helpers ────────────────────────────────────────────────────────────────
 
     def _detect_device(self) -> str:
         try:
@@ -597,6 +597,37 @@ class TrainingAgent:
 
         hf_id = HF_ID_OVERRIDES.get(hf_id, hf_id)
         effective_plan = {**model_plan, "hf_id": hf_id}
+
+        # ── 4-bit safety net ────────────────────────────────────────────────
+        # ModelSelectionAgent may set use_4bit=False for a 7B model if it
+        # mis-measured available VRAM (e.g. right after an OOM crash).
+        # Enforce 4-bit loading whenever the model is too large for the GPU,
+        # and update batch_size to match (4bit pairs with batch_size=2).
+        try:
+            import torch
+            if (
+                device == "cuda"
+                and torch.cuda.is_available()
+                and not effective_plan.get("use_4bit", False)
+            ):
+                total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                params_b = 0.0
+                for m in MODEL_CATALOGUE:
+                    if m["hf_id"].lower() == hf_id.lower():
+                        params_b = float(m.get("params_b", 0))
+                        break
+                # Rule: >= 7B params on a GPU with < 16 GB total VRAM → force 4-bit
+                if params_b >= 7.0 and total_vram_gb < 16.0:
+                    logger.warning(
+                        f"[Training] Safety net: {hf_id} is {params_b}B params but "
+                        f"use_4bit=False on a {total_vram_gb:.1f} GB GPU — "
+                        f"overriding to use_4bit=True and batch_size=2 to prevent OOM."
+                    )
+                    effective_plan["use_4bit"]   = True
+                    effective_plan["batch_size"] = 2
+        except Exception as _4bit_check_err:
+            logger.warning(f"[Training] 4-bit safety net check failed: {_4bit_check_err}")
+        # ── end safety net ───────────────────────────────────────────────────
 
         logger.info(f"[Training] Loading requested model: {hf_id}")
         try:
@@ -836,12 +867,7 @@ class TrainingAgent:
         # to paper over here.
 
         # Squeeze a stray leading batch-of-one dim off sequence fields for
-        # EVERY model family, not just Qwen-VL. Some HF processors return
-        # [[ids...]] (batch-of-one) instead of [ids...] for a single example
-        # even with return_tensors=None; if that nested shape ever slips
-        # past FeatureEngineeringAgent's own flattening (e.g. an older
-        # cached feature set), torch.stack() during collation would produce
-        # a 3D tensor here too, not just for Qwen-VL.
+        # EVERY model family, not just Qwen-VL.
         train_ds = self._squeeze_sequence_columns(train_ds)
         val_ds   = self._squeeze_sequence_columns(val_ds)
 
@@ -1076,7 +1102,6 @@ class TrainingAgent:
 
 if __name__ == "__main__":
     import sys, torch
-    sys.path.insert(0, str(Path(__file__).parent.parent))
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s][%(levelname)s] %(message)s")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
