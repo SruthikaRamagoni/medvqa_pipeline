@@ -51,6 +51,9 @@ FAILURE_CLASSES = ("oom", "load_error", "tensor_dim_mismatch",
 # tensor-dimension mismatch (ragged pixel_values / stray leading dims).
 TENSOR_FRAGILE_FAMILIES = {"qwen_vl", "blip2", "instructblip", "llava", "phi_vision"}
 
+# Text-only families — no vision encoder, always invalid for VQA tasks.
+TEXT_ONLY_FAMILIES = {"flan_t5", "seq2seq"}
+
 
 class ModelSelectionAgent:
     """
@@ -116,15 +119,16 @@ class ModelSelectionAgent:
                 failed_models.append(fid)
             failure_reason = failure_reason or failure_context.get("reason", "")
 
-        resources = self._detect_resources()
-        device    = resources["device"]
-        vram_gb   = resources["vram_gb"]
-        ram_gb    = resources["ram_gb"]
-
         failure_class = self._infer_failure_class(failure_reason) if failure_reason else ""
         failed_families = {
             self._detect_model_family(fid) for fid in failed_models
         }
+
+        # CHANGE 2: flush GPU cache and use total VRAM when retrying after OOM
+        resources = self._detect_resources(flush=(failure_class == "oom"))
+        device    = resources["device"]
+        vram_gb   = resources["vram_gb"]
+        ram_gb    = resources["ram_gb"]
 
         if failure_reason:
             logger.info(
@@ -139,10 +143,9 @@ class ModelSelectionAgent:
             failed_families=failed_families,
         )
         if not scored:
-            # Last-resort fallback: cheapest text-only model, even if it
-            # technically matches a failed family (better than total halt).
-            scored = [m for m in MODEL_CATALOGUE
-                      if m["name"] == "Flan-T5-Base"] or [MODEL_CATALOGUE[0]]
+            # Last-resort fallback: cheapest vision model available.
+            # flan_t5 / seq2seq are excluded from VQA so we don't use them here.
+            scored = [MODEL_CATALOGUE[0]]
 
         top3_summary = "\n".join(
             f"{i+1}. {m['name']} | hf_id={m['hf_id']} | "
@@ -179,7 +182,8 @@ class ModelSelectionAgent:
         if llm_hf_id and llm_hf_id.lower() not in [f.lower() for f in failed_models]:
             for m in MODEL_CATALOGUE:
                 if llm_hf_id.lower() in m["hf_id"].lower():
-                    if self._detect_model_family(m["hf_id"]) not in failed_families:
+                    m_family = self._detect_model_family(m["hf_id"])
+                    if m_family not in failed_families and m_family not in TEXT_ONLY_FAMILIES:
                         best = m
                     break
 
@@ -242,16 +246,20 @@ class ModelSelectionAgent:
 
     # ── Resource detection ────────────────────────────────────────────────────
 
-    def _detect_resources(self) -> Dict[str, Any]:
+    def _detect_resources(self, flush: bool = False) -> Dict[str, Any]:
+        # CHANGE 1: flush=True clears GPU cache and reports total VRAM (not
+        # total-reserved), so an OOM retry sees 14.6 GB instead of 0.1 GB.
         import psutil
         ram_gb = psutil.virtual_memory().total / (1024 ** 3)
         try:
             import torch
             if torch.cuda.is_available():
+                if flush:
+                    torch.cuda.empty_cache()
                 device            = "cuda"
                 vram_gb           = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
                 reserved_gb       = torch.cuda.memory_reserved(0) / (1024 ** 3)
-                vram_available_gb = vram_gb - reserved_gb
+                vram_available_gb = vram_gb if flush else (vram_gb - reserved_gb)
                 gpu_name          = torch.cuda.get_device_name(0)
                 logger.info(
                     f"GPU detected: {gpu_name} | Total VRAM: {vram_gb:.1f}GB | "
@@ -361,6 +369,15 @@ class ModelSelectionAgent:
                 continue
 
             m_family = self._detect_model_family(m["hf_id"])
+
+            # CHANGE 3: text-only families have no vision encoder — always
+            # invalid for VQA regardless of VRAM or failure class.
+            if m_family in TEXT_ONLY_FAMILIES:
+                logger.debug(
+                    f"[ModelSelection] Excluded (text-only, no vision encoder): "
+                    f"{m['hf_id']} [{m_family}]"
+                )
+                continue
 
             # Structural failure classes (tensor-shape / processor issues)
             # exclude the WHOLE family, not just the exact failed model,
