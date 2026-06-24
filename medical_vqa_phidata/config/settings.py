@@ -13,7 +13,7 @@ PROCESSED_DATA_DIR = os.getenv("PROCESSED_DATA_DIR", "./data/processed")
 FEATURE_DATA_DIR   = os.getenv("FEATURE_DATA_DIR",   "./data/features")   # ← NEW
 MAX_SAMPLES        = int(os.getenv("MAX_SAMPLES",    "5000"))
 TARGET_IMAGE_SIZE  = (224, 224)
-MAX_SEQ_LEN        = 128
+MAX_SEQ_LEN        = 512
 
 # ── Training ──────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR     = os.getenv("CHECKPOINT_DIR", "./artifacts/checkpoints")
