@@ -126,45 +126,92 @@ class EvaluationAgent:
         import torch
         hf_id = model_plan["hf_id"]
         dtype = torch.float16 if device == "cuda" else torch.float32
+
+        # FIX 1: use {"": 0} not "auto" — same reason as training_agent:
+        # device_map="auto" triggers DataParallel on dual-T4 which breaks
+        # bitsandbytes 4-bit and causes CUBLAS failures.
         load_kw = dict(pretrained_model_name_or_path=hf_id, trust_remote_code=True,
-                       torch_dtype=dtype)
+                       dtype=dtype)
         if device == "cuda":
-            load_kw["device_map"] = "auto"
+            load_kw["device_map"] = {"": 0}
+
+        # FIX 2: try Qwen2_5_VLForConditionalGeneration first for Qwen2.5-VL
+        # AutoModelForVision2Seq often resolves to the wrong class or a
+        # Placeholder for newer Qwen releases, causing silent empty output.
+        hid_lower = hf_id.lower()
+        if "qwen2.5-vl" in hid_lower:
+            priority = ["Qwen2_5_VLForConditionalGeneration",
+                        "AutoModelForVision2Seq", "AutoModelForCausalLM"]
+        elif "qwen2-vl" in hid_lower:
+            priority = ["Qwen2VLForConditionalGeneration",
+                        "AutoModelForVision2Seq", "AutoModelForCausalLM"]
+        else:
+            priority = ["AutoModelForVision2Seq", "AutoModelForCausalLM",
+                        "AutoModelForSeq2SeqLM"]
 
         model = None
-        for cls_name in ["AutoModelForVision2Seq", "AutoModelForCausalLM", "AutoModelForSeq2SeqLM"]:
+        for cls_name in priority:
             try:
                 import transformers as tf
                 cls = getattr(tf, cls_name, None)
+                if cls is None:
+                    # Try submodule for Qwen classes not yet at top-level
+                    try:
+                        import importlib
+                        submod = {
+                            "Qwen2_5_VLForConditionalGeneration": "transformers.models.qwen2_5_vl",
+                            "Qwen2VLForConditionalGeneration":    "transformers.models.qwen2_vl",
+                        }.get(cls_name)
+                        if submod:
+                            cls = getattr(importlib.import_module(submod), cls_name, None)
+                    except Exception:
+                        pass
                 if cls:
                     model = cls.from_pretrained(**load_kw)
+                    logger.info(f"[Evaluation] Loaded base model with {cls_name}")
                     break
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[Evaluation] {cls_name} load failed: {e}")
                 continue
 
-        # Load LoRA adapters
-        if model and Path(checkpoint_path).exists():
+        if model is None:
+            logger.error(f"[Evaluation] Could not load base model {hf_id}")
+            return None, None
+
+        # Load LoRA adapters from checkpoint
+        if Path(checkpoint_path).exists():
             try:
                 from peft import PeftModel
                 model = PeftModel.from_pretrained(model, checkpoint_path)
                 model = model.merge_and_unload()
                 logger.info("[Evaluation] LoRA adapters merged.")
             except Exception as e:
-                logger.warning(f"[Evaluation] PEFT load failed: {e}")
+                logger.warning(f"[Evaluation] PEFT load failed (running base model): {e}")
 
-        if model:
-            model.eval()
+        model.eval()
 
+        # FIX 3: ALWAYS load processor from hf_id, never from checkpoint_path.
+        # The LoRA checkpoint directory only contains adapter_config.json +
+        # adapter weights + model_plan.json — it has NO processor/tokenizer
+        # files. Loading from checkpoint_path raises FileNotFoundError or
+        # silently falls back to a default tokenizer that doesn't know about
+        # image tokens, so every generation call produces garbage / empty output.
         try:
             from transformers import AutoProcessor
-            processor = AutoProcessor.from_pretrained(checkpoint_path, trust_remote_code=True)
+            processor = AutoProcessor.from_pretrained(hf_id, trust_remote_code=True)
+            logger.info(f"[Evaluation] Loaded processor from base model {hf_id}")
         except Exception:
             try:
                 from transformers import AutoTokenizer
-                processor = AutoTokenizer.from_pretrained(checkpoint_path, trust_remote_code=True)
-            except Exception:
-                from transformers import AutoTokenizer
                 processor = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
+                logger.info(f"[Evaluation] Loaded tokenizer from base model {hf_id}")
+            except Exception as e:
+                logger.error(f"[Evaluation] Processor load failed: {e}")
+                return model, None
+
+        inner = getattr(processor, "tokenizer", processor)
+        if hasattr(inner, "pad_token") and inner.pad_token is None:
+            inner.pad_token = inner.eos_token
 
         return model, processor
 
@@ -172,12 +219,19 @@ class EvaluationAgent:
         import torch
         from PIL import Image
 
+        if model is None or processor is None:
+            logger.error("[Evaluation] model or processor is None — skipping generation.")
+            return [{"question": r.get("question",""), "ground_truth": r.get("answer",""),
+                     "prediction": ""} for r in records]
+
+        tok = getattr(processor, "tokenizer", processor)
+        pad_id = getattr(tok, "pad_token_id", None) or getattr(tok, "eos_token_id", 1)
+
         results = []
-        for rec in records:
+        for i, rec in enumerate(records):
             question = rec.get("question", "")
-            gt       = rec.get("answer", "")
-            img_path = rec.get("image_path", "")
-            prompt   = f"Question: {question}\nAnswer:"
+            gt       = rec.get("answer",   "")
+            img_path = rec.get("image_path", "") or rec.get("img_path", "")
 
             prediction = ""
             try:
@@ -186,30 +240,76 @@ class EvaluationAgent:
                     if img_path and Path(img_path).exists():
                         image = Image.open(img_path).convert("RGB")
 
-                    if image and hasattr(processor, "image_processor"):
-                        if hasattr(processor, "apply_chat_template"):
-                            msgs = [{"role": "user", "content": [
-                                {"type": "image"}, {"type": "text", "text": prompt}
-                            ]}]
-                            text = processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-                            inputs = processor(text=text, images=[image], return_tensors="pt").to(device)
-                        else:
-                            inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
+                    if image is not None and hasattr(processor, "apply_chat_template"):
+                        # Qwen2.5-VL / Qwen2-VL path
+                        msgs = [{"role": "user", "content": [
+                            {"type": "image"}, {"type": "text", "text": question},
+                        ]}]
+                        text = processor.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=True)
+                        inputs = processor(
+                            text=text, images=[image], return_tensors="pt"
+                        ).to(device)
+                    elif image is not None and hasattr(processor, "image_processor"):
+                        # BLIP-2 / LLaVA / InstructBLIP path
+                        prompt = f"Question: {question}\nAnswer:"
+                        inputs = processor(
+                            images=image, text=prompt, return_tensors="pt"
+                        ).to(device)
                     else:
-                        tok = getattr(processor, "tokenizer", processor)
-                        inputs = tok(prompt, return_tensors="pt", truncation=True, max_length=256).to(device)
+                        # Text-only fallback
+                        prompt = f"Question: {question}\nAnswer:"
+                        inputs = tok(
+                            prompt, return_tensors="pt",
+                            truncation=True, max_length=256,
+                        ).to(device)
 
-                    out = model.generate(**inputs, max_new_tokens=64, do_sample=False,
-                                         pad_token_id=getattr(processor, "eos_token_id", 1))
-                    gen = out[0][inputs["input_ids"].shape[-1]:]
-                    tok = getattr(processor, "tokenizer", processor)
-                    prediction = tok.decode(gen, skip_special_tokens=True).strip()
+                    # FIX: pass only the keys the model actually accepts.
+                    # Passing extra keys (e.g. token_type_ids) to Qwen2.5-VL
+                    # raises a TypeError and produces no output. Filter to the
+                    # forward-signature keys only.
+                    import inspect
+                    try:
+                        sig_keys = set(inspect.signature(model.forward).parameters.keys())
+                        # Always keep pixel_values / image_grid_thw even if
+                        # they don't appear by name in the signature (some
+                        # models accept **kwargs)
+                        safe_inputs = {
+                            k: v for k, v in inputs.items()
+                            if k in sig_keys
+                            or k in {"pixel_values", "image_grid_thw",
+                                     "input_ids", "attention_mask"}
+                        }
+                    except Exception:
+                        safe_inputs = dict(inputs)
+
+                    out = model.generate(
+                        **safe_inputs,
+                        max_new_tokens=64,
+                        do_sample=False,
+                        pad_token_id=pad_id,
+                    )
+                    # Decode only the generated tokens (skip the prompt)
+                    prompt_len = safe_inputs["input_ids"].shape[-1]
+                    gen_tokens = out[0][prompt_len:]
+                    prediction = tok.decode(gen_tokens, skip_special_tokens=True).strip()
+
             except Exception as e:
-                logger.debug(f"Generation failed: {e}")
+                logger.warning(f"[Evaluation] Record {i} generation failed: {type(e).__name__}: {e}")
 
-            results.append({"question": question, "ground_truth": gt, "prediction": prediction})
+            results.append({
+                "question": question,
+                "ground_truth": gt,
+                "prediction": prediction,
+            })
 
         logger.info(f"[Evaluation] Generated {len(results)} predictions.")
+        # Log a few samples so it's easy to verify output quality in logs
+        for s in results[:3]:
+            logger.info(
+                f"[Evaluation] SAMPLE — Q: {s['question'][:60]!r} | "
+                f"GT: {s['ground_truth']!r} | PRED: {s['prediction']!r}"
+            )
         return results
 
     def _compute_metrics(self, results: List[Dict]) -> Dict:
