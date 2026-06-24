@@ -254,8 +254,10 @@ def run_pipeline(args) -> PipelineState:
             feature_path=state.feature_data_path,
             model_plan=model_plan,
             device=state.device,
+            processed_data_path=state.processed_data_path,
+            dataset_size=collection_result["records_count"],
+            modality=state.modality,
         )
-
         if training_result.get("status") == "failed":
 
             state.retry_count += 1
@@ -290,11 +292,13 @@ def run_pipeline(args) -> PipelineState:
                         fe_result.get("message", "")
                     )
                     break
-
                 training_result = training_agent.train(
                     feature_path=fe_result["feature_path"],
                     model_plan=retry_plan,
                     device=state.device,
+                    processed_data_path=state.processed_data_path,
+                    dataset_size=collection_result["records_count"],
+                    modality=state.modality,
                 )
 
                 if training_result.get("status") != "failed":
