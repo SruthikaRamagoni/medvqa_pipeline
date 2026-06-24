@@ -183,8 +183,14 @@ class ModelSelectionAgent:
                         best = m
                     break
 
-        use_4bit = (vram_gb < best["min_vram"]) and (device == "cuda")
         family   = self._detect_model_family(best["hf_id"])
+        # Never apply 4-bit to text-only / sub-1B models:
+        # (a) bitsandbytes 4-bit + device_map="auto" wraps T4 in DataParallel
+        #     which fires CUBLAS_STATUS_EXECUTION_FAILED on sm_75 hardware.
+        # (b) flan-t5-base/large fit in fp16 trivially — 4-bit adds zero benefit.
+        _text_only_families = {"flan_t5", "seq2seq"}
+        _skip_4bit = (family in _text_only_families) or (best.get("params_b", 0) < 1.0)
+        use_4bit = (vram_gb < best["min_vram"]) and (device == "cuda") and not _skip_4bit
         compat   = self._compat_metadata(family, best["hf_id"])
 
         plan = {
