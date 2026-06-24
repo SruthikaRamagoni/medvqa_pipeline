@@ -224,25 +224,12 @@ class ModelSelectionAgent:
             "epochs":         5 if dataset_size < 500 else 3,
             "learning_rate":  2e-4,
 
-            # Feature engineering
-            # FIX: use family-appropriate max_seq_len.
-            # 128 is far too short for vision-language models — Qwen2.5-VL's
-            # image tokens alone can consume 100-200+ tokens at 224px, leaving
-            # almost no room for the answer span. This truncates answer tokens
-            # away during encoding, producing near-zero real training targets
-            # and explains why eval loss stopped improving after epoch 1.
-            _SEQ_LEN = {
-                "qwen_vl":      512,   # patchified image tokens are long
-                "phi_vision":   512,
-                "llava":        512,
-                "instructblip": 256,
-                "blip2":        256,
-                "idefics":      512,
-                "flan_t5":      128,
-                "seq2seq":      128,
-                "causal":       256,
-            }
-            "max_seq_len":    _SEQ_LEN.get(family, 256),
+            # Feature engineering — family-aware seq len (vision models need >> 128)
+            "max_seq_len":    {
+                "qwen_vl": 512, "phi_vision": 512, "llava": 512,
+                "instructblip": 256, "blip2": 256, "idefics": 512,
+                "flan_t5": 128, "seq2seq": 128, "causal": 256,
+            }.get(family, 256),
 
             # Retry bookkeeping
             "excluded_models": failed_models,
