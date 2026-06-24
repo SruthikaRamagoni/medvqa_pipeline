@@ -784,16 +784,46 @@ class FeatureEngineeringAgent:
         return entry
 
     # ── Model-specific encoders ────────────────────────────────────────────────
-
-    def _encode_seq2seq(self, question, answer, tokenizer, max_len) -> Dict:
+    def _encode_seq2seq(self, question, answer, tokenizer, max_len) -> dict:
+        """
+        Encode a seq2seq (T5/BART) record.
+     
+        FIX: removed `with tokenizer.as_target_tokenizer():` which was
+        deprecated in transformers ~4.40 and fully removed in 5.0.
+        For T5-family models the tokenizer is symmetric — calling it
+        directly for the target sequence is identical.
+        """
         prompt = f"Medical question: {question}"
-        inp = tokenizer(prompt, max_length=max_len, padding="max_length",
-                         truncation=True, return_tensors=None)
-        with tokenizer.as_target_tokenizer():
-            tgt = tokenizer(answer, max_length=64, padding="max_length",
-                             truncation=True, return_tensors=None)
-        labels = [t if t != tokenizer.pad_token_id else -100 for t in tgt["input_ids"]]
-        return {"input_ids": inp["input_ids"], "attention_mask": inp["attention_mask"], "labels": labels}
+     
+        inp = tokenizer(
+            prompt,
+            max_length=max_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors=None,
+        )
+     
+        # Direct call — no as_target_tokenizer context manager needed
+        tgt = tokenizer(
+            answer,
+            max_length=64,
+            padding="max_length",
+            truncation=True,
+            return_tensors=None,
+        )
+     
+        labels = [
+            t if t != tokenizer.pad_token_id else -100
+            for t in tgt["input_ids"]
+        ]
+     
+        return {
+            "input_ids":      inp["input_ids"],
+            "attention_mask": inp["attention_mask"],
+            "labels":         labels,
+        }
+ 
+    
 
     def _encode_blip2(self, question, answer, image, processor, max_len) -> Dict:
         prompt = f"Question: {question} Answer:"
