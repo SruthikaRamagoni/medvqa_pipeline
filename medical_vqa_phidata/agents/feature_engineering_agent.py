@@ -633,13 +633,23 @@ class FeatureEngineeringAgent:
                         if reject_reason and reject_reason not in seen_errors and len(error_samples) < 5:
                             seen_errors.add(reject_reason)
                             error_samples.append(f"validation_rejected: {reject_reason}")
+                            # FIX: log immediately on first occurrence so the cause is
+                            # visible within seconds, not only after the full dataset.
+                            logger.warning(
+                                f"[FeatureEng] Record {i} validation rejected "
+                                f"(first occurrence, will not repeat): {reject_reason}"
+                            )
                         skipped += 1
                 except Exception as e:
                     msg = f"{type(e).__name__}: {e}"
                     if msg not in seen_errors and len(error_samples) < 5:
                         seen_errors.add(msg)
                         error_samples.append(msg)
-                    logger.warning(f"[FeatureEng] Record {i} encoding failed: {msg}")
+                        # FIX: log immediately on first occurrence
+                        logger.warning(
+                            f"[FeatureEng] Record {i} encoding failed "
+                            f"(first occurrence, will not repeat): {msg}"
+                        )
                     skipped += 1
             finally:
                 if image is not None:
@@ -722,6 +732,12 @@ class FeatureEngineeringAgent:
             if model_family == "qwen_vl":
                 if rank not in (2, 3):
                     return f"qwen_vl pixel_values rank={rank} (expected 2 or 3)"
+            elif model_family == "phi_vision":
+                # Phi-3.5-vision AutoProcessor returns (1, num_crops, 3, H, W)
+                # i.e. rank-5. This is valid — the extra leading crop-batch dim
+                # is stripped in _flatten_sequence_fields before saving.
+                if rank not in (3, 4, 5):
+                    return f"phi_vision pixel_values rank={rank} (expected 3, 4, or 5)"
             else:
                 if rank not in (3, 4):
                     return f"{model_family} pixel_values rank={rank} (expected 3 or 4)"
@@ -777,6 +793,12 @@ class FeatureEngineeringAgent:
                     arr = arr[0]
                 if arr.ndim == 4 and arr.shape[0] == 1:
                     pass
+                # FIX: Phi-3.5-vision returns (1, num_crops, 3, H, W) — rank 5.
+                # Squeeze the leading batch-of-one dim to get (num_crops, 3, H, W).
+                # The training collator then stacks these per-example tensors
+                # into (B, num_crops, 3, H, W) correctly.
+                if arr.ndim == 5 and arr.shape[0] == 1:
+                    arr = arr[0]  # → (num_crops, 3, H, W)
                 entry["pixel_values"] = arr.tolist()
             except Exception:
                 pass
