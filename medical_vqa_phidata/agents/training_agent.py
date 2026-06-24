@@ -637,7 +637,12 @@ class TrainingAgent:
                 load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
             )
-            load_kw["device_map"] = "auto"
+            # FIX: use {"": 0} instead of "auto" to pin the whole model to GPU 0.
+            # device_map="auto" triggers DataParallel when multiple GPUs are visible,
+            # and bitsandbytes 4-bit matmul is broken inside DataParallel on T4
+            # (sm_75) — it fires CUBLAS_STATUS_EXECUTION_FAILED immediately.
+            # Pinning to a single GPU avoids that entirely.
+            load_kw["device_map"] = {"": 0}
         elif device == "cuda":
             load_kw["dtype"]      = dtype
             load_kw["device_map"] = "auto"
