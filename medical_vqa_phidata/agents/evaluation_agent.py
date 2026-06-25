@@ -50,19 +50,30 @@ class EvaluationAgent:
         Args:
             checkpoint_path: Path to fine-tuned LoRA checkpoint.
             processed_data_path: Path to processed JSONL data.
-            model_plan: Dict with hf_id and architecture info.
+            model_plan: Fallback dict with hf_id and architecture info (used
+                        only if model_plan.json cannot be read from the
+                        checkpoint directory).
             device: 'cuda' | 'cpu'.
 
         Returns:
             Dict with all metrics and LLM assessment.
         """
+        # ── GROUND-TRUTH MODEL PLAN: always read from checkpoint ─────────────
+        # training_agent._save() writes model_plan.json into the checkpoint
+        # directory. That file records the model that was *actually* trained,
+        # which may differ from what model_plan was passed here (e.g. after
+        # the self-healing retry loop switched to a different model). Always
+        # loading from the checkpoint guarantees evaluation uses the correct
+        # base model and architecture, regardless of what was passed in.
+        effective_plan = self._load_plan_from_checkpoint(checkpoint_path, model_plan)
+
         # Load eval records
         eval_records = self._load_eval_records(processed_data_path)
         if not eval_records:
             return {"status": "failed", "message": "No evaluation records found"}
 
         # Load model
-        model, processor = self._load_model(checkpoint_path, model_plan, device)
+        model, processor = self._load_model(checkpoint_path, effective_plan, device)
 
         # Generate predictions
         results = self._generate_predictions(model, processor, eval_records, device)
@@ -111,7 +122,56 @@ class EvaluationAgent:
             "metrics": metrics,
             "assessment": assessment,
             "report_path": str(report_path),
+            "model_plan_used": effective_plan,
         }
+
+    def _load_plan_from_checkpoint(
+        self, checkpoint_path: str, fallback_plan: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Load model_plan.json from the checkpoint directory.
+
+        training_agent._save() always writes model_plan.json into the
+        checkpoint directory alongside the adapter weights. That file is
+        the ground truth: it records exactly which base model and
+        architecture were used for training, including any model that was
+        selected by the self-healing retry loop (which may differ from
+        the original model_plan passed into the pipeline).
+
+        Falls back to ``fallback_plan`` with a warning if the file is
+        missing (e.g. when pointing at a hand-crafted checkpoint that
+        pre-dates this convention).
+        """
+        if not checkpoint_path:
+            logger.warning(
+                "[Evaluation] checkpoint_path is empty — using passed-in "
+                "model_plan as fallback. Metrics may reflect the wrong model."
+            )
+            return fallback_plan
+
+        plan_file = Path(checkpoint_path) / "model_plan.json"
+        if plan_file.exists():
+            try:
+                loaded = json.loads(plan_file.read_text())
+                logger.info(
+                    f"[Evaluation] Loaded model_plan.json from checkpoint: "
+                    f"hf_id={loaded.get('hf_id')!r}  name={loaded.get('name')!r}"
+                )
+                return loaded
+            except Exception as e:
+                logger.warning(
+                    f"[Evaluation] Could not parse model_plan.json at "
+                    f"{plan_file}: {e} — falling back to passed-in model_plan."
+                )
+        else:
+            logger.warning(
+                f"[Evaluation] model_plan.json not found in checkpoint "
+                f"directory '{checkpoint_path}'. Falling back to passed-in "
+                f"model_plan (hf_id={fallback_plan.get('hf_id')!r}). "
+                f"If this is unexpected, check that training_agent._save() "
+                f"completed successfully."
+            )
+        return fallback_plan
 
     def _load_eval_records(self, path: str) -> List[Dict]:
         if not path or not Path(path).exists():
