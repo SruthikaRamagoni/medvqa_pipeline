@@ -161,9 +161,13 @@ class ModelSelectionAgent:
                 f"failure looks structural (tensor shape / processor issues).\n"
             )
 
+        # FIX: show vram_total (physical GPU memory) not vram_gb (available).
+        # After an OOM crash, available VRAM ≈ 0.1 GB — the LLM reads that
+        # and correctly concludes only flan-t5 fits, overriding scored[0]
+        # (Qwen). Using total VRAM gives the LLM the right hardware picture.
         prompt = (
             f"Select the best model for Medical Visual Question Answering.\n"
-            f"Hardware: device={device}  VRAM={vram_gb:.1f}GB  RAM={ram_gb:.1f}GB\n"
+            f"Hardware: device={device}  VRAM={vram_total:.1f}GB total  RAM={ram_gb:.1f}GB\n"
             f"Dataset:  {dataset_size} samples  modality={modality}\n"
             f"{failure_clause}\n"
             f"Top candidates:\n{top3_summary}\n\n"
@@ -413,6 +417,14 @@ class ModelSelectionAgent:
                 score *= 0.8
             if m_family in failed_families:
                 score *= 0.5  # soft penalty even for non-structural failures
+
+            # FIX: hard-penalise text-only models for VQA tasks.
+            # flan-t5 / seq2seq have no vision encoder — they physically cannot
+            # process images. Selecting them for Med-VQA produces train_loss≈32
+            # (vs ≈1.1 for Qwen) and all-zero eval metrics. Apply a heavy score
+            # penalty so they only win if ALL vision models are also excluded.
+            if not m.get("vision", False):
+                score *= 0.05  # drops flan-t5-base from 0.60 → 0.03
 
             feasible.append({**m, "_score": score})
 
