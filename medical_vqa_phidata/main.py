@@ -262,9 +262,15 @@ def run_pipeline(args) -> PipelineState:
 
             state.retry_count += 1
             state.failure_reason = training_result.get("failure_reason", "")
-            state.previous_models.append(
-                training_result.get("model_used", "")
-            )
+            # FIX: seed previous_models with ALL models training_agent tried
+            # internally (it runs up to 4 retries itself). training_result
+            # contains "excluded_models" — the full list of hf_ids that were
+            # attempted during the internal retry loop.
+            internally_tried = training_result.get("excluded_models", [])
+            last_tried = training_result.get("model_used", "")
+            for m in internally_tried + ([last_tried] if last_tried else []):
+                if m and m not in state.previous_models:
+                    state.previous_models.append(m)
 
             while state.retry_count <= MAX_MODEL_RETRIES:
 
@@ -272,13 +278,23 @@ def run_pipeline(args) -> PipelineState:
                     f"Retry {state.retry_count}/{MAX_MODEL_RETRIES}"
                 )
 
+                # FIX: pass the FULL failed-model history, not just the last one.
+                # training_agent exhausts all 4 internal retries and returns
+                # model_used = only the final attempt. Passing that alone to
+                # select_model means all previously-tried models (instructblip,
+                # llava, phi, qwen) are back in contention for the outer retry
+                # → instructblip is reselected → OOM loop repeats forever.
+                # state.previous_models accumulates every model_used across all
+                # attempts, so passing it excludes the full history.
+                all_failed = list(dict.fromkeys(
+                    state.previous_models
+                    + [training_result.get("model_used", "")]
+                ))
                 retry_plan = model_sel_agent.select_model(
                     dataset_size=collection_result["records_count"],
                     modality=state.modality,
-                    failure_context={
-                        "failed_hf_id": training_result.get("model_used", ""),
-                        "reason": training_result.get("failure_reason", ""),
-                    },
+                    failed_models=all_failed,
+                    failure_reason=training_result.get("failure_reason", ""),
                 )
 
                 fe_result = fe_agent.engineer_features(
