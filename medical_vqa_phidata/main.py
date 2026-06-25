@@ -312,6 +312,14 @@ def run_pipeline(args) -> PipelineState:
                         training_result["checkpoint_path"]
                     )
 
+                    # FIX: update model_plan to the plan that actually succeeded.
+                    # Without this, the original model_plan (e.g. instructblip)
+                    # is passed to evaluate() even though a different model
+                    # (e.g. flan-t5 / Qwen) was trained — evaluation then tries
+                    # to load the wrong model class and fails with
+                    # "Unrecognized configuration class".
+                    model_plan = retry_plan
+
                     break
 
                 state.retry_count += 1
