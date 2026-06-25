@@ -195,7 +195,14 @@ class ModelSelectionAgent:
         # (b) flan-t5-base/large fit in fp16 trivially — 4-bit adds zero benefit.
         _text_only_families = {"flan_t5", "seq2seq"}
         _skip_4bit = (family in _text_only_families) or (best.get("params_b", 0) < 1.0)
-        use_4bit = (vram_gb < best["min_vram"]) and (device == "cuda") and not _skip_4bit
+        # FIX: use vram_total (physical) not vram_gb (available) to decide 4bit.
+        # After an OOM crash, available VRAM ≈ 0.2 GB → vram_gb < min_vram is
+        # always True → every model gets use_4bit=True including instructblip-7B
+        # which still OOMs even in 4bit (needs ~7 GB), and Qwen gets 4bit which
+        # quantizes the visual encoder → StopIteration.
+        # Physical total VRAM is the right budget: 14.6 GB >= 6.0 GB min_vram
+        # for Qwen → use_4bit=False, loads cleanly in fp16.
+        use_4bit = (vram_total < best["min_vram"]) and (device == "cuda") and not _skip_4bit
         compat   = self._compat_metadata(family, best["hf_id"])
 
         plan = {
