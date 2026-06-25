@@ -271,7 +271,9 @@ class TrainingAgent:
             current_feature_path = fe_result["feature_path"]
 
         # Should not normally reach here
-        return self._fail("Retry loop exhausted unexpectedly.", model_used=current_plan.get("hf_id", ""))
+        return self._fail("Retry loop exhausted unexpectedly.",
+                          model_used=current_plan.get("hf_id", ""),
+                          excluded_models=failed_models)
 
     # ── Single training attempt (original core logic) ──────────────────────
 
@@ -400,7 +402,7 @@ class TrainingAgent:
 
     # ── Failure contract / classification helpers ───────────────────────────
 
-    def _fail(self, message: str, model_used: str = "", checkpoint_path: str = "") -> Dict[str, Any]:
+    def _fail(self, message: str, model_used: str = "", checkpoint_path: str = "", excluded_models: list = None) -> Dict[str, Any]:
         logger.error(f"[Training] FAILED — {message}")
         return {
             "status":            "failed",
@@ -409,6 +411,7 @@ class TrainingAgent:
             "model_used":        model_used,
             "failure_reason":    self._classify_failure(message),
             "retry_recommended": True,
+            "excluded_models":   excluded_models or [],
         }
 
     def _classify_failure(self, message: str) -> str:
