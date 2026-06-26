@@ -13,11 +13,9 @@ PROCESSED_DATA_DIR = os.getenv("PROCESSED_DATA_DIR", "./data/processed")
 FEATURE_DATA_DIR   = os.getenv("FEATURE_DATA_DIR",   "./data/features")   # ← NEW
 MAX_SAMPLES        = int(os.getenv("MAX_SAMPLES",    "5000"))
 TARGET_IMAGE_SIZE  = (224, 224)
-MAX_SEQ_LEN        = 512    # FIX: 512 caused ALL records to be skipped for LLaVA (576 patch tokens).
-                             #      512 is now correct for Phi-3.5 because FeatureEngineeringAgent
-                             #      loads the processor with num_crops=1 (cutting image tokens from
-                             #      ~750 to ~144). LLaVA uses 1024; the family-aware per-model
-                             #      max_seq_len in ModelSelectionAgent overrides this default.
+MAX_SEQ_LEN        = 1024   # Phi-3.5-vision with num_crops=1 still produces ~780 image tokens
+                             # on high-res inputs (the crop count controls tiling, not resolution).
+                             # 1024 leaves ~244 tokens for the answer — ample for VQA short answers.
 
 # ── Training ──────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR     = os.getenv("CHECKPOINT_DIR", "./artifacts/checkpoints")
@@ -73,7 +71,8 @@ MODEL_CATALOGUE = [
         "params_b":       3.0,
         "min_vram":       6.0,
         "min_vram_4bit":  3.5,
-        "quality":        0.80,
+        "quality":        0.85,  # best VQA fit on T4: dynamic resolution, native vision2seq,
+                                  # lower VRAM than Phi-3.5, shorter encoded sequences
         "target_modules": ["q_proj", "v_proj"],
         "architecture":   "causal",
         "loader":         "AutoModelForVision2Seq",
