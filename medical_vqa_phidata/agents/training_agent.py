@@ -648,7 +648,14 @@ class TrainingAgent:
             load_kw["device_map"] = {"": 0}
         elif device == "cuda":
             load_kw["dtype"]      = dtype
-            load_kw["device_map"] = "auto"
+            # FIX: always pin to GPU 0; never use "auto".
+            # device_map="auto" on a dual-T4 node spreads layers across both
+            # GPUs and activates NCCL for inter-GPU communication. After an
+            # earlier model OOMed on GPU 0, GPU 1 may still hold stale state
+            # → NCCL Error 1: unhandled cuda error on first training step.
+            # Pinning to {"": 0} keeps all tensors on one device and avoids
+            # NCCL entirely.
+            load_kw["device_map"] = {"": 0}
         else:
             load_kw["dtype"] = dtype
 
