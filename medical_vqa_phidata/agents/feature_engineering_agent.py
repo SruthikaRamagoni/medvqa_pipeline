@@ -494,7 +494,8 @@ class FeatureEngineeringAgent:
     # VRAM at the typical batch sizes ModelSelectionAgent picks.
     _MAX_LEN_CEILING: Dict[str, int] = {
         "qwen_vl":    2048,
-        "phi_vision":  512,  # num_crops=1 → ~144 image tokens; 512 is ample
+        "phi_vision": 1024,  # num_crops=1 still produces ~780 tokens on high-res images;
+                              # 1024 leaves ~244 tokens for the answer, which is ample for VQA.
         "llava":      1024,
         "instructblip": 512,
         "blip2":       512,
