@@ -187,15 +187,11 @@ class FeatureEngineeringAgent:
             # v4: qwen_vl effective max_len auto-resolution (image-token
             #     expansion could make prompt_len saturate at max_len,
             #     masking 100% of labels when max_seq_len was too small).
-            # v5: max_len probe AND _encode_qwen_vl's true_prompt_len /
-            #     result["input_ids"] now route through _unwrap_token_ids.
-            #     Without it, return_tensors=None processor output wrapped
-            #     as [[id,id,...]] made every length check measure the
-            #     outer wrapper (=1) instead of the real token count —
-            #     v4's probe always reported "1 token", never resized
-            #     max_len, and the original all-masked-labels bug
-            #     persisted even with v4 in place.
-            "label_masking_version": 5,
+            # v6: num_crops=1 for phi_vision (cuts image tokens ~750→~144),
+            #     adaptive max_len probe extended to ALL vision families
+            #     (was qwen_vl-only), _encode_phi_vision now auto-resizes
+            #     effective_max_len per-record instead of skipping.
+            "label_masking_version": 6,
         }
 
         feature_path = self._feature_path_for(hf_id, model_family)
@@ -396,13 +392,30 @@ class FeatureEngineeringAgent:
 
     # ── Processor loading ─────────────────────────────────────────────────────
 
+    # Per-family processor kwargs. num_crops=1 for phi_vision cuts image tokens
+    # from ~750 (4 crops × ~144 + overhead) down to ~144, so the prompt fits
+    # comfortably within max_seq_len=512 and almost no records are skipped.
+    # Values here are merged into AutoProcessor.from_pretrained kwargs at load
+    # time; add entries for any future family that needs non-default settings.
+    _PROCESSOR_KWARGS: Dict[str, Dict[str, Any]] = {
+        "phi_vision": {"num_crops": 1},
+    }
+
     def _load_processor(self, hf_id: str, model_family: str):
         processor = None
         tokenizer = None
         try:
             if model_family in VISION_FAMILIES:
                 from transformers import AutoProcessor
-                processor = AutoProcessor.from_pretrained(hf_id, trust_remote_code=True)
+                extra_kwargs = self._PROCESSOR_KWARGS.get(model_family, {})
+                if extra_kwargs:
+                    logger.info(
+                        f"[FeatureEng] Loading AutoProcessor for {hf_id} "
+                        f"with family-specific kwargs: {extra_kwargs}"
+                    )
+                processor = AutoProcessor.from_pretrained(
+                    hf_id, trust_remote_code=True, **extra_kwargs
+                )
                 tokenizer = getattr(processor, "tokenizer", processor)
                 logger.info(f"[FeatureEng] Loaded AutoProcessor for {hf_id}")
             elif model_family in ("flan_t5", "seq2seq"):
@@ -475,22 +488,46 @@ class FeatureEngineeringAgent:
 
     # ── Encoding ──────────────────────────────────────────────────────────────
 
-    _QWEN_VL_MAX_LEN_CEILING = 2048
+    # Hard ceiling per family — prevents a single very long record from
+    # inflating max_len to something that causes OOM during training.
+    # Adaptive: each family's ceiling is chosen to fit comfortably on T4-class
+    # VRAM at the typical batch sizes ModelSelectionAgent picks.
+    _MAX_LEN_CEILING: Dict[str, int] = {
+        "qwen_vl":    2048,
+        "phi_vision":  512,  # num_crops=1 → ~144 image tokens; 512 is ample
+        "llava":      1024,
+        "instructblip": 512,
+        "blip2":       512,
+        "idefics":    1024,
+        "flan_t5":     256,
+        "seq2seq":     256,
+        "causal":      512,
+    }
+    _DEFAULT_MAX_LEN_CEILING = 1024
 
     def _resolve_effective_max_len(
         self, records: List[Dict], processor, model_family: str, max_len: int,
         sample_size: int = 8,
     ) -> int:
-        if model_family != "qwen_vl":
+        """
+        Probe a small sample of records (prompt-only, no answer) to measure
+        the real token count after image expansion, then auto-raise max_len
+        if the configured value would leave fewer than min_answer_tokens tokens
+        for the answer.
+
+        Previously this only ran for qwen_vl. Now it runs for ALL vision
+        families, because any high-resolution vision model can produce a
+        prompt that overflows the configured max_seq_len and causes mass
+        record-skipping (which was the root cause of the OOM: 67% of records
+        were being encoded, accumulated in Arrow, and the remaining 33% had
+        large tensors that pushed RAM over the limit).
+        """
+        if model_family not in VISION_FAMILIES:
             return max_len
-        if not hasattr(processor, "apply_chat_template"):
+        if processor is None:
             return max_len
-        if max_len >= 256:
-            logger.info(
-                f"[FeatureEng] qwen_vl: configured max_seq_len={max_len} is "
-                f"already >= 256 — skipping the max_len probe pass."
-            )
-            return max_len
+
+        ceiling = self._MAX_LEN_CEILING.get(model_family, self._DEFAULT_MAX_LEN_CEILING)
 
         import gc
 
@@ -508,13 +545,17 @@ class FeatureEngineeringAgent:
             if image is None:
                 continue
             try:
-                messages = [{"role": "user", "content": [
-                    {"type": "image"}, {"type": "text", "text": question},
-                ]}]
-                prompt_text = processor.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True)
-                enc = processor(text=prompt_text, images=[image],
-                                 return_tensors=None, truncation=False)
+                # Build prompt text using the same template as the encoder,
+                # without an answer, so we measure only the prompt's token cost.
+                prompt_text = self._build_prompt_text(model_family, question, processor)
+                if prompt_text is None:
+                    continue
+
+                # Probe without truncation to see the true expanded length.
+                enc = self._probe_encode(model_family, processor, prompt_text, image)
+                if enc is None:
+                    continue
+
                 real_tokens = self._unwrap_token_ids(enc["input_ids"])
                 worst_case = max(worst_case, len(real_tokens))
                 checked += 1
@@ -533,43 +574,85 @@ class FeatureEngineeringAgent:
 
         if checked == 0:
             logger.warning(
-                "[FeatureEng] Could not probe any record to resolve "
-                "qwen_vl's effective max_len (no usable image+question "
-                f"found in first {sample_size} records) — falling back to "
-                f"configured max_seq_len={max_len}."
+                f"[FeatureEng] {model_family}: could not probe any record "
+                f"(no usable image+question in first {sample_size} records) "
+                f"— falling back to configured max_seq_len={max_len}."
             )
             return max_len
 
         needed = worst_case + min_answer_tokens
         if needed <= max_len:
             logger.info(
-                f"[FeatureEng] qwen_vl max_len probe: worst-case sampled "
-                f"prompt={worst_case} tokens, fits within configured "
+                f"[FeatureEng] {model_family} max_len probe: worst-case "
+                f"prompt={worst_case} tokens fits within configured "
                 f"max_seq_len={max_len}. No adjustment needed."
             )
             return max_len
 
-        resolved = min(needed, self._QWEN_VL_MAX_LEN_CEILING)
+        resolved = min(needed, ceiling)
         if resolved < needed:
             logger.warning(
-                f"[FeatureEng] qwen_vl max_len probe: worst-case sampled "
+                f"[FeatureEng] {model_family} max_len probe: worst-case "
                 f"prompt={worst_case} tokens needs {needed} total, but "
-                f"that exceeds the safety ceiling of "
-                f"{self._QWEN_VL_MAX_LEN_CEILING}. Using the ceiling — "
-                f"some long-prompt records may still be skipped during "
-                f"encoding if their prompt alone exceeds this length."
+                f"that exceeds the family ceiling {ceiling}. "
+                f"Using ceiling={resolved} — a small fraction of very "
+                f"long-prompt records may still be skipped, but the vast "
+                f"majority will encode successfully."
             )
         else:
             logger.info(
-                f"[FeatureEng] qwen_vl max_len probe: worst-case sampled "
+                f"[FeatureEng] {model_family} max_len probe: worst-case "
                 f"prompt={worst_case} tokens exceeds configured "
-                f"max_seq_len={max_len}. Auto-raising effective max_len to "
-                f"{resolved} for this dataset so answer tokens are never "
-                f"truncated away entirely. Consider setting "
-                f"model_plan['max_seq_len'] >= {resolved} directly to "
-                f"avoid relying on this auto-resolution."
+                f"max_seq_len={max_len}. Auto-raising effective max_len "
+                f"to {resolved} so answer tokens are never fully truncated. "
+                f"Consider setting model_plan['max_seq_len']>={resolved} "
+                f"to skip this probe next run."
             )
         return resolved
+
+    def _build_prompt_text(self, model_family: str, question: str, processor) -> Optional[str]:
+        """Return the prompt string (no answer) for a given family, or None on error."""
+        try:
+            if model_family == "qwen_vl":
+                if not hasattr(processor, "apply_chat_template"):
+                    return None
+                messages = [{"role": "user", "content": [
+                    {"type": "image"}, {"type": "text", "text": question},
+                ]}]
+                return processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True)
+            elif model_family == "phi_vision":
+                return f"<|user|>\n<|image_1|>\n{question}<|end|>\n<|assistant|>\n"
+            elif model_family == "llava":
+                return f"USER: <image>\n{question}\nASSISTANT:"
+            elif model_family in ("blip2", "instructblip"):
+                return f"Question: {question} Answer:"
+            elif model_family == "idefics":
+                return f"User: <image>{question}\nAssistant:"
+            else:
+                return f"Question: {question}\nAnswer:"
+        except Exception as e:
+            logger.debug(f"[FeatureEng] _build_prompt_text failed for {model_family}: {e}")
+            return None
+
+    def _probe_encode(self, model_family: str, processor, prompt_text: str, image) -> Optional[Dict]:
+        """Encode prompt-only (no truncation) to measure real token count."""
+        try:
+            if model_family == "qwen_vl":
+                return processor(text=prompt_text, images=[image],
+                                  return_tensors=None, truncation=False)
+            elif model_family in ("phi_vision", "llava", "idefics"):
+                return processor(text=prompt_text, images=[image],
+                                  return_tensors=None, truncation=False)
+            elif model_family in ("blip2", "instructblip"):
+                return processor(images=image, text=prompt_text,
+                                  return_tensors=None, truncation=False)
+            else:
+                tok = getattr(processor, "tokenizer", processor)
+                return tok(prompt_text, return_tensors=None, truncation=False)
+        except Exception as e:
+            logger.debug(f"[FeatureEng] _probe_encode failed for {model_family}: {e}")
+            return None
 
     def _encode_records_gen(
         self, records, processor, tokenizer, model_family, is_vision, architecture, max_len,
@@ -1011,37 +1094,53 @@ class FeatureEngineeringAgent:
         """
         Encode a single record for Phi-3.5-vision-instruct.
 
-        ROOT CAUSE OF 'labels fully masked' BUG (this revision):
-            Same issue as LLaVA: prompt_len was measured WITHOUT truncation
-            (~777 tokens for Phi-3.5 at 336px + question). After encoding
-            full_text with truncation to max_len=1024, seq_len was ~800 tokens.
-            _mask_prompt_and_padding got prompt_len=777 vs seq_len=800 —
-            only 23 answer tokens remained, but typically the answer IS
-            those 23 tokens and the rest are padding — so all non-padding
-            tokens got masked. _validate_entry caught this as 'labels fully
-            masked' and rejected every record.
+        ADAPTIVE MAX_LEN:
+            Instead of raising ValueError and skipping the record when prompt_len
+            is too close to max_len, we auto-expand max_len (up to the family
+            ceiling) to accommodate the actual prompt. This means virtually no
+            records are skipped for ordinary questions — only truly pathological
+            inputs (question > ceiling tokens alone) are rejected.
 
-            FIX: encode prompt-only WITH truncation to get the true in-sequence
-            prompt span, not the pre-truncation expanded length.
+            Combined with num_crops=1 (set in _PROCESSOR_KWARGS), the typical
+            prompt is ~200-250 tokens, so max_seq_len=512 fits comfortably.
         """
         min_answer_tokens = 4
+        ceiling = self._MAX_LEN_CEILING.get("phi_vision", 1024)
         if image is not None:
             prompt_text = f"<|user|>\n<|image_1|>\n{question}<|end|>\n<|assistant|>\n"
             full_text   = f"{prompt_text}{answer}<|end|>"
             tok = getattr(processor, "tokenizer", processor)
 
-            # Encode full sequence WITH truncation
+            # Probe prompt-only WITHOUT truncation to get the true expanded length.
+            probe_enc  = processor(text=prompt_text, images=[image],
+                                    return_tensors=None, truncation=False)
+            probe_ids  = self._unwrap_token_ids(probe_enc["input_ids"])
+            true_prompt_len = len(probe_ids)
+            del probe_enc, probe_ids
+
+            # Auto-raise effective max_len if needed (up to ceiling).
+            effective_max_len = max(max_len, true_prompt_len + min_answer_tokens)
+            effective_max_len = min(effective_max_len, ceiling)
+
+            if true_prompt_len + min_answer_tokens > effective_max_len:
+                raise ValueError(
+                    f"Phi-3.5: prompt alone is {true_prompt_len} tokens, "
+                    f"which exceeds the family ceiling {ceiling} even with "
+                    f"min_answer_tokens={min_answer_tokens}. Skipping record."
+                )
+
+            # Encode full sequence WITH truncation at effective_max_len
             enc = processor(
                 text=full_text, images=[image],
                 return_tensors=None, padding="max_length",
-                truncation=True, max_length=max_len,
+                truncation=True, max_length=effective_max_len,
             )
             input_ids = self._unwrap_token_ids(enc["input_ids"])
 
-            # Encode prompt-only WITH same truncation
+            # Encode prompt-only WITH same truncation to get in-sequence span
             prompt_only_enc = processor(
                 text=prompt_text, images=[image],
-                return_tensors=None, truncation=True, max_length=max_len,
+                return_tensors=None, truncation=True, max_length=effective_max_len,
             )
             prompt_ids = self._unwrap_token_ids(prompt_only_enc["input_ids"])
             prompt_len = len(prompt_ids)
@@ -1049,9 +1148,9 @@ class FeatureEngineeringAgent:
             if len(input_ids) - prompt_len < min_answer_tokens:
                 raise ValueError(
                     f"Phi-3.5: only {len(input_ids) - prompt_len} answer tokens survive "
-                    f"after truncation to max_seq_len={max_len} "
+                    f"after truncation to effective_max_len={effective_max_len} "
                     f"(prompt occupies {prompt_len}/{len(input_ids)} tokens). "
-                    f"Increase max_seq_len."
+                    f"Skipping record."
                 )
         else:
             tok = getattr(processor, "tokenizer", processor)
