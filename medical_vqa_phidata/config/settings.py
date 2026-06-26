@@ -13,8 +13,11 @@ PROCESSED_DATA_DIR = os.getenv("PROCESSED_DATA_DIR", "./data/processed")
 FEATURE_DATA_DIR   = os.getenv("FEATURE_DATA_DIR",   "./data/features")   # ← NEW
 MAX_SAMPLES        = int(os.getenv("MAX_SAMPLES",    "5000"))
 TARGET_IMAGE_SIZE  = (224, 224)
-MAX_SEQ_LEN        = 1024   # FIX: 512 caused ALL records to be skipped for LLaVA (576 patch tokens)
-                             #      and Phi-3.5 (~257 image tokens). 1024 fits both comfortably.
+MAX_SEQ_LEN        = 512    # FIX: 512 caused ALL records to be skipped for LLaVA (576 patch tokens).
+                             #      512 is now correct for Phi-3.5 because FeatureEngineeringAgent
+                             #      loads the processor with num_crops=1 (cutting image tokens from
+                             #      ~750 to ~144). LLaVA uses 1024; the family-aware per-model
+                             #      max_seq_len in ModelSelectionAgent overrides this default.
 
 # ── Training ──────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR     = os.getenv("CHECKPOINT_DIR", "./artifacts/checkpoints")
