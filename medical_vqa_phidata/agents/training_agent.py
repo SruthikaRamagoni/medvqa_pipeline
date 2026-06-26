@@ -76,8 +76,20 @@ from phi.agent import Agent
 from phi.model.groq import Groq
 
 from typing import Any, Dict, List, Optional, Tuple
-import json, logging, re
+import json, logging, os, re
 from pathlib import Path
+
+# ── NCCL / CUDA env vars — must be set BEFORE any torch/CUDA import ──────────
+# T4 GPUs do not support NVLink or InfiniBand peer-to-peer. Without these,
+# NCCL probes for P2P on the first all-reduce and raises "NCCL Error 1:
+# unhandled cuda error" even on single-GPU Trainer runs (because Trainer's
+# ddp setup touches NCCL regardless). Setting them here at module import time
+# guarantees they are in the environment before torch, transformers, or
+# Trainer are ever imported anywhere in the process.
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+os.environ.setdefault("NCCL_IB_DISABLE",  "1")
+# Reduce CUDA memory fragmentation after prior OOM events.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 logger = logging.getLogger(__name__)
 
@@ -182,12 +194,23 @@ class TrainingAgent:
 
             # Failure path
             failed_hf_id = current_plan.get("hf_id", "")
-            if failed_hf_id and failed_hf_id not in failed_models:
-                failed_models.append(failed_hf_id)
-
             canonical_reason = self._classify_failure(result.get("message", ""))
             result["failure_reason"] = canonical_reason
             self._log_failed_model(failed_hf_id, canonical_reason, result.get("message", ""))
+
+            # NCCL errors are environment-setup failures, not model failures.
+            # The module-level env var fix means retrying the same model will
+            # succeed. Do NOT add the model to failed_models or change family.
+            if canonical_reason == "nccl_error":
+                logger.warning(
+                    f"[Training] NCCL error on attempt {attempt} for "
+                    f"{failed_hf_id} — this is a P2P/IB env issue, not a "
+                    f"model failure. NCCL_P2P_DISABLE and NCCL_IB_DISABLE "
+                    f"are already set; retrying same model."
+                )
+            else:
+                if failed_hf_id and failed_hf_id not in failed_models:
+                    failed_models.append(failed_hf_id)
 
             retries_left = (MAX_RETRIES + 1) - attempt
             can_retry = retries_left > 0 and processed_data_path is not None
@@ -417,7 +440,16 @@ class TrainingAgent:
     def _classify_failure(self, message: str) -> str:
         """Maps a free-text error onto a canonical failure_reason code."""
         m = (message or "").lower()
-        if any(k in m for k in ("out of memory", "cuda error", "oom", "cudaoutofmemory")):
+        # NCCL errors must be classified before oom — "cuda error" appears in
+        # both, but NCCL errors are a training-setup issue (P2P disabled env
+        # vars not set early enough), not an out-of-memory issue. Classifying
+        # them as "oom" causes the retry to exclude the entire qwen_vl family
+        # permanently, which is wrong — the model fits fine, the NCCL env var
+        # fix (module-level setdefault in this file) will prevent recurrence.
+        if any(k in m for k in ("nccl error", "nccl_error", "unhandled cuda error")):
+            return "nccl_error"
+        if any(k in m for k in ("out of memory", "oom", "cudaoutofmemory",
+                                 "memory allocation", "unable to allocate")):
             return "oom"
         if any(k in m for k in ("unmasked", "labels identical to input_ids", "labels fully masked")):
             return "unmasked_labels"
@@ -980,19 +1012,9 @@ class TrainingAgent:
         import transformers
         from transformers import TrainingArguments, Trainer, EarlyStoppingCallback, default_data_collator
 
-        # FIX: NCCL Error 1 on T4 VMs.
-        # T4 GPUs on GCP/Colab do NOT support NCCL peer-to-peer (NVLink/IB
-        # is not present). When PyTorch's Trainer initialises the distributed
-        # backend (even for single-GPU runs that triggered NCCL via a prior
-        # multi-GPU device_map), NCCL probes for P2P and fires
-        # "unhandled cuda error" on the very first all-reduce operation.
-        # Disabling P2P and IB forces NCCL to fall back to host-memory
-        # transfers, which work correctly on T4 single-GPU setups.
-        os.environ.setdefault("NCCL_P2P_DISABLE", "1")
-        os.environ.setdefault("NCCL_IB_DISABLE", "1")
-        # Also set PYTORCH_ALLOC_CONF to reduce fragmentation after prior OOMs.
-        os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-        logger.info("[Training] NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 set (T4 P2P workaround)")
+        # NCCL env vars are set at module import time (top of this file)
+        # to ensure they're in place before any CUDA/torch init occurs.
+        # The setdefault calls that used to live here have been moved there.
 
         use_fp16 = precision == "fp16" and torch.cuda.is_available()
         use_bf16 = False
