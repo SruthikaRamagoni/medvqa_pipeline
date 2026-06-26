@@ -879,52 +879,67 @@ class FeatureEngineeringAgent:
     def _encode_llava(self, question, answer, image, processor, max_len):
         """
         Encode a single record for LLaVA-family models.
-     
-        FIX (vs previous version):
-            prompt_only_enc["input_ids"] unwrapped via _unwrap_token_ids()
-            before len() — same batch-of-one wrapper issue as phi_vision.
+
+        ROOT CAUSE OF 'labels fully masked' BUG (this revision):
+            LLaVA-1.5 at 336px expands <image> to 576 patch tokens.
+            The old code measured prompt_len WITHOUT truncation (~597 tokens),
+            then encoded full_text WITH truncation to max_len. After truncation,
+            input_ids has ~600-700 tokens total. _mask_prompt_and_padding then
+            got prompt_len=597 against seq_len=~600 — masking nearly everything,
+            including the answer tokens. _validate_entry correctly caught this as
+            'labels fully masked' and rejected every record.
+
+            FIX: encode both prompt-only AND full_text WITH the same truncation
+            applied. prompt_len = len(truncated prompt ids) is guaranteed <= seq_len,
+            so answer tokens always survive.
         """
+        min_answer_tokens = 4
         prompt_text = f"USER: <image>\n{question}\nASSISTANT:"
         full_text   = f"{prompt_text} {answer}"
-     
+
         if image is not None:
-            # FIX: measure prompt_len WITHOUT truncation.
-            # LLaVA-1.5 expands <image> to 576 patch tokens at 336px.
-            # truncation=True cuts input_ids to max_len but text still has
-            # 576 <image> placeholders → "Mismatch: ids=[507] text=[576]".
-            prompt_only_enc = processor(
-                text=prompt_text, images=image,
-                return_tensors=None, truncation=False,
-            )
-            prompt_ids = self._unwrap_token_ids(prompt_only_enc["input_ids"])
-            prompt_len = len(prompt_ids)
             tok = getattr(processor, "tokenizer", processor)
-            if prompt_len >= max_len:
-                raise ValueError(
-                    f"LLaVA expanded prompt is {prompt_len} tokens >= max_seq_len={max_len}."
-                )
+
+            # Encode full sequence WITH truncation
             enc = processor(
                 text=full_text, images=image,
                 return_tensors=None, padding="max_length",
                 truncation=True, max_length=max_len,
             )
-        else:
-            tok = getattr(processor, "tokenizer", processor)
-            prompt_only_enc = tok(
-                prompt_text, return_tensors=None, truncation=False,
+            input_ids = self._unwrap_token_ids(enc["input_ids"])
+
+            # Encode prompt-only WITH same truncation to get in-sequence prompt span
+            prompt_only_enc = processor(
+                text=prompt_text, images=image,
+                return_tensors=None, truncation=True, max_length=max_len,
             )
             prompt_ids = self._unwrap_token_ids(prompt_only_enc["input_ids"])
             prompt_len = len(prompt_ids)
+
+            if len(input_ids) - prompt_len < min_answer_tokens:
+                raise ValueError(
+                    f"LLaVA: only {len(input_ids) - prompt_len} answer tokens survive "
+                    f"after truncation to max_seq_len={max_len} "
+                    f"(prompt occupies {prompt_len}/{len(input_ids)} tokens). "
+                    f"Increase max_seq_len."
+                )
+        else:
+            tok = getattr(processor, "tokenizer", processor)
             enc = tok(
                 full_text, return_tensors=None, padding="max_length",
                 truncation=True, max_length=max_len,
             )
-     
+            input_ids = self._unwrap_token_ids(enc["input_ids"])
+            prompt_only_enc = tok(
+                prompt_text, return_tensors=None, truncation=True, max_length=max_len,
+            )
+            prompt_ids = self._unwrap_token_ids(prompt_only_enc["input_ids"])
+            prompt_len = len(prompt_ids)
+
         result = {k: v for k, v in enc.items()}
+        result["input_ids"] = input_ids
         pad_id = getattr(tok, "pad_token_id", None)
-        result["labels"] = self._mask_prompt_and_padding(
-            result["input_ids"], prompt_len, pad_id
-        )
+        result["labels"] = self._mask_prompt_and_padding(input_ids, prompt_len, pad_id)
         return result
 
 
@@ -994,58 +1009,68 @@ class FeatureEngineeringAgent:
     def _encode_phi_vision(self, question, answer, image, processor, max_len):
         """
         Encode a single record for Phi-3.5-vision-instruct.
-     
-        FIX (vs previous version):
-            prompt_only_enc["input_ids"] is passed through _unwrap_token_ids()
-            before len() is called, because Phi's AutoProcessor returns
-            [[id, id, ...]] (batch-of-one wrapper) when return_tensors=None.
-            Without the unwrap, len() == 1 instead of the real token count,
-            which caused _mask_prompt_and_padding to mask only 1 token,
-            leaving labels ≈ input_ids and causing _validate_entry to reject
-            EVERY record → Encoded=0, Skipped=2244.
+
+        ROOT CAUSE OF 'labels fully masked' BUG (this revision):
+            Same issue as LLaVA: prompt_len was measured WITHOUT truncation
+            (~777 tokens for Phi-3.5 at 336px + question). After encoding
+            full_text with truncation to max_len=1024, seq_len was ~800 tokens.
+            _mask_prompt_and_padding got prompt_len=777 vs seq_len=800 —
+            only 23 answer tokens remained, but typically the answer IS
+            those 23 tokens and the rest are padding — so all non-padding
+            tokens got masked. _validate_entry caught this as 'labels fully
+            masked' and rejected every record.
+
+            FIX: encode prompt-only WITH truncation to get the true in-sequence
+            prompt span, not the pre-truncation expanded length.
         """
+        min_answer_tokens = 4
         if image is not None:
             prompt_text = f"<|user|>\n<|image_1|>\n{question}<|end|>\n<|assistant|>\n"
             full_text   = f"{prompt_text}{answer}<|end|>"
-     
-            # FIX: measure prompt_len WITHOUT truncation.
-            # Phi's image tokens (~256 at 336px) + question fills max_len,
-            # making prompt_len == max_len → all labels masked → rejected.
-            prompt_only_enc = processor(
-                text=prompt_text, images=[image],
-                return_tensors=None, truncation=False,
-            )
-            prompt_ids = self._unwrap_token_ids(prompt_only_enc["input_ids"])
-            prompt_len = len(prompt_ids)
             tok = getattr(processor, "tokenizer", processor)
-            if prompt_len >= max_len:
-                raise ValueError(
-                    f"Phi-3.5 expanded prompt is {prompt_len} tokens >= max_seq_len={max_len}."
-                )
+
+            # Encode full sequence WITH truncation
             enc = processor(
                 text=full_text, images=[image],
                 return_tensors=None, padding="max_length",
                 truncation=True, max_length=max_len,
             )
+            input_ids = self._unwrap_token_ids(enc["input_ids"])
+
+            # Encode prompt-only WITH same truncation
+            prompt_only_enc = processor(
+                text=prompt_text, images=[image],
+                return_tensors=None, truncation=True, max_length=max_len,
+            )
+            prompt_ids = self._unwrap_token_ids(prompt_only_enc["input_ids"])
+            prompt_len = len(prompt_ids)
+
+            if len(input_ids) - prompt_len < min_answer_tokens:
+                raise ValueError(
+                    f"Phi-3.5: only {len(input_ids) - prompt_len} answer tokens survive "
+                    f"after truncation to max_seq_len={max_len} "
+                    f"(prompt occupies {prompt_len}/{len(input_ids)} tokens). "
+                    f"Increase max_seq_len."
+                )
         else:
             tok = getattr(processor, "tokenizer", processor)
             prompt_text = f"<|user|>\n{question}<|end|>\n<|assistant|>\n"
             full_text   = f"{prompt_text}{answer}<|end|>"
-            prompt_only_enc = tok(
-                prompt_text, return_tensors=None, truncation=False,
-            )
-            prompt_ids = self._unwrap_token_ids(prompt_only_enc["input_ids"])
-            prompt_len = len(prompt_ids)
             enc = tok(
                 full_text, return_tensors=None, padding="max_length",
                 truncation=True, max_length=max_len,
             )
-     
+            input_ids = self._unwrap_token_ids(enc["input_ids"])
+            prompt_only_enc = tok(
+                prompt_text, return_tensors=None, truncation=True, max_length=max_len,
+            )
+            prompt_ids = self._unwrap_token_ids(prompt_only_enc["input_ids"])
+            prompt_len = len(prompt_ids)
+
         result = {k: v for k, v in enc.items()}
+        result["input_ids"] = input_ids
         pad_id = getattr(tok, "pad_token_id", None)
-        result["labels"] = self._mask_prompt_and_padding(
-            result["input_ids"], prompt_len, pad_id
-        )
+        result["labels"] = self._mask_prompt_and_padding(input_ids, prompt_len, pad_id)
         return result
 
     def _encode_causal(self, question, answer, tokenizer, max_len) -> Dict:
