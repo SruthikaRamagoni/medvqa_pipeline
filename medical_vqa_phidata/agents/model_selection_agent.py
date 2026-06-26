@@ -251,11 +251,13 @@ class ModelSelectionAgent:
             # Feature engineering — family-aware seq len.
             # FIX: vision models MUST be >> 512:
             #   LLaVA-1.5 expands <image> to 576 patch tokens at 336px → need >= 1024
-            #   Phi-3.5-vision: image tokens ~257 + question ~520 = ~777 prompt tokens
-            #     alone → need >= 2048 to leave room for answer tokens.
+            #   Phi-3.5-vision: with num_crops=1 image tokens ~144 + question ~80 = ~224
+            #     prompt tokens → 512 is ample and keeps per-record tensor size small.
+            #     (Old value was 2048, based on default num_crops=4 which produced ~750
+            #      image tokens alone and caused mass record-skipping + OOM.)
             #   Qwen-VL: dynamic patch count, 1024 is sufficient for most cases.
             "max_seq_len":    {
-                "qwen_vl": 1024, "phi_vision": 2048, "llava": 1024,
+                "qwen_vl": 1024, "phi_vision": 512, "llava": 1024,
                 "instructblip": 512, "blip2": 512, "idefics": 1024,
                 "flan_t5": 128, "seq2seq": 128, "causal": 256,
             }.get(family, 256),
