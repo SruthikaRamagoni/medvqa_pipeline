@@ -181,12 +181,24 @@ class ModelSelectionAgent:
         llm_hf_id = self._parse_response(response)
 
         best = scored[0]
+        # FIX: LLM override is only honoured if the model it picks is ALREADY
+        # in the scored (hardware-feasible) list. Previously the code searched
+        # all of MODEL_CATALOGUE, so the LLM could pick InstructBLIP-7B even
+        # after _score_models had correctly excluded it for exceeding VRAM.
+        # Now: if llm_hf_id is not in scored, we silently use scored[0].
+        scored_ids = {m["hf_id"].lower() for m in scored}
         if llm_hf_id and llm_hf_id.lower() not in [f.lower() for f in failed_models]:
-            for m in MODEL_CATALOGUE:
+            for m in scored:   # only search hardware-feasible candidates
                 if llm_hf_id.lower() in m["hf_id"].lower():
                     if self._detect_model_family(m["hf_id"]) not in failed_families:
                         best = m
                     break
+            else:
+                logger.info(
+                    f"[ModelSelection] LLM chose '{llm_hf_id}' but it is not in the "
+                    f"hardware-feasible scored list — ignoring LLM pick, using "
+                    f"scored[0]={scored[0]['hf_id']} instead."
+                )
 
         family   = self._detect_model_family(best["hf_id"])
         # Never apply 4-bit to text-only / sub-1B models:
@@ -238,14 +250,12 @@ class ModelSelectionAgent:
 
             # Feature engineering — family-aware seq len.
             # FIX: vision models MUST be >> 512:
-            #   LLaVA-1.5 expands <image> to 576 patch tokens at 336px.
-            #   With max_seq_len=512, every record was skipped (prompt alone
-            #   = ~597 tokens > 512) → dataset empty → training never started.
-            #   Phi-3.5-vision expands to ~257 image tokens → ~777 total.
-            #   1024 fits LLaVA and Phi comfortably. Qwen-VL's
-            #   _resolve_effective_max_len() auto-raises if still too small.
+            #   LLaVA-1.5 expands <image> to 576 patch tokens at 336px → need >= 1024
+            #   Phi-3.5-vision: image tokens ~257 + question ~520 = ~777 prompt tokens
+            #     alone → need >= 2048 to leave room for answer tokens.
+            #   Qwen-VL: dynamic patch count, 1024 is sufficient for most cases.
             "max_seq_len":    {
-                "qwen_vl": 1024, "phi_vision": 1024, "llava": 1024,
+                "qwen_vl": 1024, "phi_vision": 2048, "llava": 1024,
                 "instructblip": 512, "blip2": 512, "idefics": 1024,
                 "flan_t5": 128, "seq2seq": 128, "causal": 256,
             }.get(family, 256),
@@ -419,11 +429,25 @@ class ModelSelectionAgent:
                     logger.debug(f"[ModelSelection] Excluded (OOM headroom vs total {vram_total:.1f}GB): {m['hf_id']}")
                     continue
 
-            # FIX: apply 75% headroom on ALL selections, not just OOM retries.
-            # instructblip-7B needs 14.0 GB but T4 has 14.6 GB total — loading
-            # succeeds (14.6 >= 14.0) but leaves 0 GB for LoRA + activations
-            # → OOM on first training step every time. A 75% headroom budget
-            # (10.95 GB) correctly excludes it and picks Qwen (6.0 GB) instead.
+            # VRAM feasibility: a model is loadable if EITHER:
+            #   (a) safe_vram >= min_vram  → can run in fp16 with headroom
+            #   (b) safe_vram >= min_vram_4bit → can run in 4-bit with headroom
+            # FIX: also add a hard ceiling — if min_vram > vram_total entirely,
+            # the model physically cannot fit even in 4bit loading mode because
+            # loading in fp16 fills VRAM before quantization applies, then OOMs.
+            # InstructBLIP-7B has min_vram=14.0, T4 has 14.6GB total → it just
+            # barely "fits" by min_vram but has 0 headroom for LoRA + activations.
+            # The 75% rule (safe_vram=10.95) catches it for fp16 (10.95 < 14.0 ✗)
+            # but NOT for 4bit (10.95 >= 7.0 ✓) — so it still passes.
+            # Hard ceiling: if min_vram > vram_total * 0.95, exclude entirely.
+            hard_ceiling = vram_total * 0.95
+            if device == "cuda" and m["min_vram"] > hard_ceiling:
+                logger.debug(
+                    f"[ModelSelection] Excluded (hard ceiling {hard_ceiling:.1f}GB): "
+                    f"{m['hf_id']} needs min_vram={m['min_vram']}GB"
+                )
+                continue
+
             safe_vram = vram_total * 0.75
             ok = (
                 True if device == "cpu"
