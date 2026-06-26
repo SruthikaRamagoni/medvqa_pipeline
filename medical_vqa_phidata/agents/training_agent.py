@@ -612,23 +612,6 @@ class TrainingAgent:
         except Exception:
             pass
         try:
-            # FIX: After a prior model OOM'd, PyTorch may hold stale CUDA
-            # state / fragmented memory. Calling empty_cache() + gc here
-            # releases all unreferenced tensors before attempting the next
-            # load, preventing the "NCCL Error 1: unhandled cuda error" that
-            # otherwise fires on the very first training step of the next
-            # attempt even when the model itself loads successfully.
-            import gc, torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                gc.collect()
-                logger.info(
-                    f"[Training] CUDA cache cleared before loading {hf_id} "
-                    f"(free={torch.cuda.mem_get_info()[0] / 1e9:.2f}GB)"
-                )
-        except Exception:
-            pass
-        try:
             model, tok = self._load_single(
                 hf_id=hf_id,
                 loader_hint=effective_plan.get("loader", "auto"),
