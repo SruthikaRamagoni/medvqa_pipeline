@@ -184,21 +184,31 @@ class ModelSelectionAgent:
         response  = self.agent.run(prompt)
 
         # On retry: allow LLM to flag a better alternative from the scored list
-        # (e.g. it notices scored[0] shares a family with a failed model that
-        # _score_models soft-penalised but did not exclude). Outside of retry
-        # mode the scorer's pick stands unconditionally.
+        # (e.g. it notices scored[0] shares a family with a failed model).
+        # CRITICAL: only accept hf_ids that actually exist in scored — the LLM
+        # can hallucinate model names from its training data (e.g. Phi-3.5 even
+        # after it was removed from the catalogue). If the LLM pick is not in
+        # scored, silently fall back to scored[0].
         if failed_models:
             llm_hf_id = self._parse_response(response)
-            if llm_hf_id and llm_hf_id.lower() not in [f.lower() for f in failed_models]:
-                for m in scored:
-                    if llm_hf_id.lower() in m["hf_id"].lower():
-                        if self._detect_model_family(m["hf_id"]) not in failed_families:
-                            best = m
-                            logger.info(
-                                f"[ModelSelection] Retry: LLM overrode scorer "
-                                f"to '{best['hf_id']}' (avoids failed family)."
-                            )
-                        break
+            scored_hf_ids = {m["hf_id"].lower() for m in scored}
+            if llm_hf_id and llm_hf_id.lower() in scored_hf_ids:
+                if llm_hf_id.lower() not in [f.lower() for f in failed_models]:
+                    for m in scored:
+                        if m["hf_id"].lower() == llm_hf_id.lower():
+                            if self._detect_model_family(m["hf_id"]) not in failed_families:
+                                best = m
+                                logger.info(
+                                    f"[ModelSelection] Retry: LLM overrode scorer "
+                                    f"to '{best['hf_id']}' (avoids failed family)."
+                                )
+                            break
+            elif llm_hf_id:
+                logger.info(
+                    f"[ModelSelection] Retry: LLM suggested '{llm_hf_id}' but it is "
+                    f"not in the current catalogue — ignoring, using scorer's pick: "
+                    f"{best['hf_id']}."
+                )
 
         family   = self._detect_model_family(best["hf_id"])
         # Never apply 4-bit to text-only / sub-1B models:
