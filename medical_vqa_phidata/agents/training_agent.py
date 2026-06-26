@@ -603,6 +603,23 @@ class TrainingAgent:
 
         logger.info(f"[Training] Loading requested model: {hf_id}")
         try:
+            # FIX: After a prior model OOM'd, PyTorch may hold stale CUDA
+            # state / fragmented memory. Calling empty_cache() + gc here
+            # releases all unreferenced tensors before attempting the next
+            # load, preventing the "NCCL Error 1: unhandled cuda error" that
+            # otherwise fires on the very first training step of the next
+            # attempt even when the model itself loads successfully.
+            import gc, torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+                logger.info(
+                    f"[Training] CUDA cache cleared before loading {hf_id} "
+                    f"(free={torch.cuda.mem_get_info()[0] / 1e9:.2f}GB)"
+                )
+        except Exception:
+            pass
+        try:
             model, tok = self._load_single(
                 hf_id=hf_id,
                 loader_hint=effective_plan.get("loader", "auto"),
@@ -640,24 +657,14 @@ class TrainingAgent:
                 load_in_4bit=True, bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4",
             )
-            # FIX: use {"": 0} instead of "auto" to pin the whole model to GPU 0.
-            # device_map="auto" triggers DataParallel when multiple GPUs are visible,
-            # and bitsandbytes 4-bit matmul is broken inside DataParallel on T4
-            # (sm_75) — it fires CUBLAS_STATUS_EXECUTION_FAILED immediately.
-            # Pinning to a single GPU avoids that entirely.
             load_kw["device_map"] = {"": 0}
         elif device == "cuda":
-            load_kw["dtype"]      = dtype
-            # FIX: always pin to GPU 0; never use "auto".
-            # device_map="auto" on a dual-T4 node spreads layers across both
-            # GPUs and activates NCCL for inter-GPU communication. After an
-            # earlier model OOMed on GPU 0, GPU 1 may still hold stale state
-            # → NCCL Error 1: unhandled cuda error on first training step.
-            # Pinning to {"": 0} keeps all tensors on one device and avoids
-            # NCCL entirely.
+            load_kw["torch_dtype"] = dtype   # FIX: was "dtype" — not a valid kwarg for from_pretrained;
+                                              # causes a warning and dtype is silently ignored for some
+                                              # model classes (e.g. Qwen2_5_VLForConditionalGeneration).
             load_kw["device_map"] = {"": 0}
         else:
-            load_kw["dtype"] = dtype
+            load_kw["torch_dtype"] = dtype   # FIX: same kwarg fix for CPU path
 
         CLASS_MAP: Dict[str, List[str]] = {
             "AutoModelForSeq2SeqLM": ["AutoModelForSeq2SeqLM"],
