@@ -13,7 +13,8 @@ PROCESSED_DATA_DIR = os.getenv("PROCESSED_DATA_DIR", "./data/processed")
 FEATURE_DATA_DIR   = os.getenv("FEATURE_DATA_DIR",   "./data/features")   # ← NEW
 MAX_SAMPLES        = int(os.getenv("MAX_SAMPLES",    "5000"))
 TARGET_IMAGE_SIZE  = (224, 224)
-MAX_SEQ_LEN        = 512
+MAX_SEQ_LEN        = 1024   # FIX: 512 caused ALL records to be skipped for LLaVA (576 patch tokens)
+                             #      and Phi-3.5 (~257 image tokens). 1024 fits both comfortably.
 
 # ── Training ──────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR     = os.getenv("CHECKPOINT_DIR", "./artifacts/checkpoints")
@@ -115,7 +116,9 @@ MODEL_CATALOGUE = [
         "hf_id":          "Salesforce/instructblip-vicuna-7b",
         "vision":         True,
         "params_b":       7.0,
-        "min_vram":       14.0,
+        "min_vram":       15.5,   # FIX: was 14.0 — exactly matched T4's 14.56GB leaving
+                                   # zero headroom for activations/LoRA → guaranteed OOM.
+                                   # 15.5 correctly excludes this model on a single T4.
         "min_vram_4bit":  7.0,
         "quality":        0.85,
         "target_modules": ["q_proj", "v_proj"],
@@ -127,7 +130,7 @@ MODEL_CATALOGUE = [
         "hf_id":          "llava-hf/llava-1.5-7b-hf",
         "vision":         True,
         "params_b":       7.0,
-        "min_vram":       14.0,
+        "min_vram":       15.5,   # FIX: was 14.0 — same OOM issue as InstructBLIP on T4.
         "min_vram_4bit":  7.0,
         "quality":        0.84,
         "target_modules": ["q_proj", "v_proj"],
