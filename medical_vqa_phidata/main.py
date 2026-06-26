@@ -352,6 +352,33 @@ def run_pipeline(args) -> PipelineState:
 
 
         state.checkpoint_path = training_result["checkpoint_path"]
+
+        # FIX: always sync state.model_* from training_result["model_used"].
+        # training_agent runs its own internal retry loop and may have trained
+        # a different model than model_plan originally requested. The pipeline
+        # summary, evaluation, and inference must all use the model that was
+        # *actually* trained (and whose checkpoint was saved).
+        actual_hf_id = training_result.get("model_used", "")
+        if actual_hf_id and actual_hf_id != state.model_hf_id:
+            from config.settings import MODEL_CATALOGUE
+            for cat in MODEL_CATALOGUE:
+                if cat["hf_id"].lower() == actual_hf_id.lower():
+                    state.model_hf_id        = cat["hf_id"]
+                    state.model_name         = cat["name"]
+                    state.model_architecture = cat["architecture"]
+                    state.model_vision       = cat.get("vision", False)
+                    # Rebuild model_plan so evaluate() receives correct metadata
+                    model_plan = {**model_plan, **{
+                        "hf_id":         cat["hf_id"],
+                        "name":          cat["name"],
+                        "architecture":  cat["architecture"],
+                        "vision":        cat.get("vision", False),
+                    }}
+                    logger.info(
+                        f"[Main] State reconciled: trained model={actual_hf_id}"
+                    )
+                    break
+
         state.log(
             f"Training done. Loss={training_result.get('train_loss','N/A')}  "
             f"Checkpoint={state.checkpoint_path}"
