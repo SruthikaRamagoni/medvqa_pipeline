@@ -170,9 +170,11 @@ class ModelSelectionAgent:
             f"Hardware: device={device}  VRAM={vram_total:.1f}GB total  RAM={ram_gb:.1f}GB\n"
             f"Dataset:  {dataset_size} samples  modality={modality}\n"
             f"{failure_clause}\n"
-            f"Top candidates:\n{top3_summary}\n\n"
-            f"Pick the model that best balances quality and hardware fit.\n"
-            f"Prefer vision models when VRAM >= 4 GB.\n\n"
+            f"Candidates ranked by hardware-aware score (rank 1 = best fit):\n{top3_summary}\n\n"
+            f"The rank-1 model is already the recommended choice based on VRAM, "
+            f"dataset size, and quality. Only pick a different model if you have "
+            f"a specific hardware or compatibility reason to do so.\n"
+            f"Prefer smaller, lighter models when quality scores are close.\n\n"
             f'Reply with ONLY: {{"selected_model_hf_id": "<hf_id>", '
             f'"model_name": "<name>", "reason": "<one sentence>"}}'
         )
@@ -257,7 +259,7 @@ class ModelSelectionAgent:
             #      image tokens alone and caused mass record-skipping + OOM.)
             #   Qwen-VL: dynamic patch count, 1024 is sufficient for most cases.
             "max_seq_len":    {
-                "qwen_vl": 1024, "phi_vision": 512, "llava": 1024,
+                "qwen_vl": 1024, "phi_vision": 1024, "llava": 1024,
                 "instructblip": 512, "blip2": 512, "idefics": 1024,
                 "flan_t5": 128, "seq2seq": 128, "causal": 256,
             }.get(family, 256),
