@@ -955,31 +955,32 @@ class FeatureEngineeringAgent:
                 messages, tokenize=False, add_generation_prompt=True)
             full_text = prompt_text + answer
 
+            # FIX: use truncation=True (same max_len as full_text encode).
+            # With truncation=False, if the image expands the prompt beyond
+            # max_len, true_prompt_len > max_len → min(true_prompt_len, max_len)
+            # == max_len == seq_len → ALL labels masked → record rejected.
+            # truncation=True caps prompt_len to what actually fits in the
+            # sequence, guaranteeing answer tokens survive.
             prompt_only_enc = processor(text=prompt_text, images=[image],
-                                         return_tensors=None, truncation=False)
+                                         return_tensors=None,
+                                         truncation=True, max_length=max_len)
             true_prompt_len = len(self._unwrap_token_ids(prompt_only_enc["input_ids"]))
 
             if true_prompt_len + min_answer_tokens > max_len:
                 raise ValueError(
                     f"qwen_vl prompt (image-expanded) is {true_prompt_len} "
                     f"tokens, leaving no room for an answer within "
-                    f"max_seq_len={max_len}. Skipping this record. If this "
-                    f"happens for most/all records, model_plan['max_seq_len'] "
-                    f"is too small for this model's image resolution — it "
-                    f"should be resolved automatically by "
-                    f"_resolve_effective_max_len() before encoding starts; "
-                    f"seeing this error means that resolution step itself "
-                    f"needs a higher ceiling or this image is unusually "
-                    f"large."
+                    f"max_seq_len={max_len}. Skipping this record."
                 )
 
-            prompt_len = min(true_prompt_len, max_len)
+            prompt_len = true_prompt_len  # already capped by truncation=True
 
             enc = processor(text=full_text, images=[image], return_tensors=None,
                              padding="max_length", truncation=True, max_length=max_len)
         else:
             prompt_text = f"Question: {question}\nAnswer:"
-            prompt_only_enc = tok(prompt_text, return_tensors=None, truncation=False)
+            prompt_only_enc = tok(prompt_text, return_tensors=None,
+                                   truncation=True, max_length=max_len)
             true_prompt_len = len(self._unwrap_token_ids(prompt_only_enc["input_ids"]))
 
             if true_prompt_len + min_answer_tokens > max_len:
@@ -988,7 +989,7 @@ class FeatureEngineeringAgent:
                     f"no room for an answer within max_seq_len={max_len}. "
                     f"Skipping this record."
                 )
-            prompt_len = min(true_prompt_len, max_len)
+            prompt_len = true_prompt_len  # already capped by truncation=True
 
             full_text = f"{prompt_text} {answer}"
             enc = tok(full_text, return_tensors=None, padding="max_length",
