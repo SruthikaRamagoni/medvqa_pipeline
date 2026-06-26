@@ -603,6 +603,15 @@ class TrainingAgent:
 
         logger.info(f"[Training] Loading requested model: {hf_id}")
         try:
+            import gc, torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.empty_cache()
+                gc.collect()
+                free_gb = _torch.cuda.mem_get_info()[0] / 1e9
+                logger.info(f"[Training] CUDA cache cleared before loading {hf_id} (free={free_gb:.2f}GB)")
+        except Exception:
+            pass
+        try:
             # FIX: After a prior model OOM'd, PyTorch may hold stale CUDA
             # state / fragmented memory. Calling empty_cache() + gc here
             # releases all unreferenced tensors before attempting the next
@@ -984,9 +993,23 @@ class TrainingAgent:
         precision, device, max_grad_norm: float = 1.0, es_patience: int = 2,
         lr_scheduler: str = "cosine", hf_id: str = "",
     ):
-        import torch
+        import os, torch
         import transformers
         from transformers import TrainingArguments, Trainer, EarlyStoppingCallback, default_data_collator
+
+        # FIX: NCCL Error 1 on T4 VMs.
+        # T4 GPUs on GCP/Colab do NOT support NCCL peer-to-peer (NVLink/IB
+        # is not present). When PyTorch's Trainer initialises the distributed
+        # backend (even for single-GPU runs that triggered NCCL via a prior
+        # multi-GPU device_map), NCCL probes for P2P and fires
+        # "unhandled cuda error" on the very first all-reduce operation.
+        # Disabling P2P and IB forces NCCL to fall back to host-memory
+        # transfers, which work correctly on T4 single-GPU setups.
+        os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+        os.environ.setdefault("NCCL_IB_DISABLE", "1")
+        # Also set PYTORCH_ALLOC_CONF to reduce fragmentation after prior OOMs.
+        os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+        logger.info("[Training] NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 set (T4 P2P workaround)")
 
         use_fp16 = precision == "fp16" and torch.cuda.is_available()
         use_bf16 = False
