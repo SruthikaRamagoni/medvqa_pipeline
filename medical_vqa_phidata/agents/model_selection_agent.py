@@ -147,7 +147,8 @@ class ModelSelectionAgent:
 
         top3_summary = "\n".join(
             f"{i+1}. {m['name']} | hf_id={m['hf_id']} | "
-            f"vision={m['vision']} | params={m['params_b']}B | quality={m['quality']}"
+            f"vision={m['vision']} | params={m['params_b']}B | "
+            f"min_vram={m['min_vram']}GB | score={m['_score']:.3f}"
             for i, m in enumerate(scored[:3])
         )
 
@@ -161,46 +162,43 @@ class ModelSelectionAgent:
                 f"failure looks structural (tensor shape / processor issues).\n"
             )
 
-        # FIX: show vram_total (physical GPU memory) not vram_gb (available).
-        # After an OOM crash, available VRAM ≈ 0.1 GB — the LLM reads that
-        # and correctly concludes only flan-t5 fits, overriding scored[0]
-        # (Qwen). Using total VRAM gives the LLM the right hardware picture.
+        # The scorer owns the final model choice. The LLM's role here is only
+        # to provide a human-readable reason string for logging/debugging.
+        # On retry (failed_models non-empty), the LLM additionally validates
+        # that scored[0] is not from a failed family — if it disagrees, its
+        # pick is honoured only if it appears in the scored list.
+        best = scored[0]
+
         prompt = (
-            f"Select the best model for Medical Visual Question Answering.\n"
+            f"Explain in one sentence why the following model was selected "
+            f"for Medical Visual Question Answering.\n"
             f"Hardware: device={device}  VRAM={vram_total:.1f}GB total  RAM={ram_gb:.1f}GB\n"
-            f"Dataset:  {dataset_size} samples  modality={modality}\n"
+            f"Dataset: {dataset_size} samples  modality={modality}\n"
             f"{failure_clause}\n"
-            f"Candidates ranked by hardware-aware score (rank 1 = best fit):\n{top3_summary}\n\n"
-            f"The rank-1 model is already the recommended choice based on VRAM, "
-            f"dataset size, and quality. Only pick a different model if you have "
-            f"a specific hardware or compatibility reason to do so.\n"
-            f"Prefer smaller, lighter models when quality scores are close.\n\n"
-            f'Reply with ONLY: {{"selected_model_hf_id": "<hf_id>", '
-            f'"model_name": "<name>", "reason": "<one sentence>"}}'
+            f"Selected model: {best['hf_id']} (score={best.get('_score', 0):.3f})\n"
+            f"Other candidates considered:\n{top3_summary}\n\n"
+            f'Reply with ONLY: {{"selected_model_hf_id": "{best["hf_id"]}", '
+            f'"model_name": "{best["name"]}", "reason": "<one sentence>"}}'
         )
 
         response  = self.agent.run(prompt)
-        llm_hf_id = self._parse_response(response)
 
-        best = scored[0]
-        # FIX: LLM override is only honoured if the model it picks is ALREADY
-        # in the scored (hardware-feasible) list. Previously the code searched
-        # all of MODEL_CATALOGUE, so the LLM could pick InstructBLIP-7B even
-        # after _score_models had correctly excluded it for exceeding VRAM.
-        # Now: if llm_hf_id is not in scored, we silently use scored[0].
-        scored_ids = {m["hf_id"].lower() for m in scored}
-        if llm_hf_id and llm_hf_id.lower() not in [f.lower() for f in failed_models]:
-            for m in scored:   # only search hardware-feasible candidates
-                if llm_hf_id.lower() in m["hf_id"].lower():
-                    if self._detect_model_family(m["hf_id"]) not in failed_families:
-                        best = m
-                    break
-            else:
-                logger.info(
-                    f"[ModelSelection] LLM chose '{llm_hf_id}' but it is not in the "
-                    f"hardware-feasible scored list — ignoring LLM pick, using "
-                    f"scored[0]={scored[0]['hf_id']} instead."
-                )
+        # On retry: allow LLM to flag a better alternative from the scored list
+        # (e.g. it notices scored[0] shares a family with a failed model that
+        # _score_models soft-penalised but did not exclude). Outside of retry
+        # mode the scorer's pick stands unconditionally.
+        if failed_models:
+            llm_hf_id = self._parse_response(response)
+            if llm_hf_id and llm_hf_id.lower() not in [f.lower() for f in failed_models]:
+                for m in scored:
+                    if llm_hf_id.lower() in m["hf_id"].lower():
+                        if self._detect_model_family(m["hf_id"]) not in failed_families:
+                            best = m
+                            logger.info(
+                                f"[ModelSelection] Retry: LLM overrode scorer "
+                                f"to '{best['hf_id']}' (avoids failed family)."
+                            )
+                        break
 
         family   = self._detect_model_family(best["hf_id"])
         # Never apply 4-bit to text-only / sub-1B models:
@@ -461,16 +459,24 @@ class ModelSelectionAgent:
                 continue
 
             score = m["quality"]
+
+            # Dynamic VRAM-efficiency bonus: models that use less of the
+            # available VRAM get a proportional bonus. On a 14.6 GB T4:
+            #   Qwen2.5-VL-3B: 6.0 GB min → headroom_ratio = (14.6-6.0)/14.6 = 0.59
+            #   Phi-3.5-vision: 8.0 GB min → headroom_ratio = (14.6-8.0)/14.6 = 0.45
+            # So Qwen gets +0.059 and Phi-3.5 gets +0.045 automatically —
+            # no hardcoded numbers, purely derived from the hardware at runtime.
+            if device == "cuda" and vram_total > 0:
+                headroom = max(0.0, vram_total - m["min_vram"]) / vram_total
+                score += headroom * 0.1   # max +0.1 bonus for most VRAM-efficient model
+
             if dataset_size < 500 and m["params_b"] > 7:
                 score *= 0.8
             if m_family in failed_families:
                 score *= 0.5  # soft penalty even for non-structural failures
 
-            # FIX: hard-penalise text-only models for VQA tasks.
-            # flan-t5 / seq2seq have no vision encoder — they physically cannot
-            # process images. Selecting them for Med-VQA produces train_loss≈32
-            # (vs ≈1.1 for Qwen) and all-zero eval metrics. Apply a heavy score
-            # penalty so they only win if ALL vision models are also excluded.
+            # Hard-penalise text-only models for VQA tasks: they have no vision
+            # encoder and produce all-zero eval metrics on image-grounded tasks.
             if not m.get("vision", False):
                 score *= 0.05  # drops flan-t5-base from 0.60 → 0.03
 
