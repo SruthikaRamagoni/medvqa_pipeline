@@ -888,31 +888,33 @@ class FeatureEngineeringAgent:
         full_text   = f"{prompt_text} {answer}"
      
         if image is not None:
+            # FIX: measure prompt_len WITHOUT truncation.
+            # LLaVA-1.5 expands <image> to 576 patch tokens at 336px.
+            # truncation=True cuts input_ids to max_len but text still has
+            # 576 <image> placeholders → "Mismatch: ids=[507] text=[576]".
             prompt_only_enc = processor(
                 text=prompt_text, images=image,
-                return_tensors=None, truncation=True, max_length=max_len,
+                return_tensors=None, truncation=False,
             )
-            # ── FIX: unwrap before len() ──
             prompt_ids = self._unwrap_token_ids(prompt_only_enc["input_ids"])
             prompt_len = len(prompt_ids)
-     
+            tok = getattr(processor, "tokenizer", processor)
+            if prompt_len >= max_len:
+                raise ValueError(
+                    f"LLaVA expanded prompt is {prompt_len} tokens >= max_seq_len={max_len}."
+                )
             enc = processor(
                 text=full_text, images=image,
                 return_tensors=None, padding="max_length",
                 truncation=True, max_length=max_len,
             )
-            tok = getattr(processor, "tokenizer", processor)
         else:
             tok = getattr(processor, "tokenizer", processor)
-     
             prompt_only_enc = tok(
-                prompt_text, return_tensors=None,
-                truncation=True, max_length=max_len,
+                prompt_text, return_tensors=None, truncation=False,
             )
-            # ── FIX: unwrap before len() ──
             prompt_ids = self._unwrap_token_ids(prompt_only_enc["input_ids"])
             prompt_len = len(prompt_ids)
-     
             enc = tok(
                 full_text, return_tensors=None, padding="max_length",
                 truncation=True, max_length=max_len,
@@ -1006,33 +1008,34 @@ class FeatureEngineeringAgent:
             prompt_text = f"<|user|>\n<|image_1|>\n{question}<|end|>\n<|assistant|>\n"
             full_text   = f"{prompt_text}{answer}<|end|>"
      
+            # FIX: measure prompt_len WITHOUT truncation.
+            # Phi's image tokens (~256 at 336px) + question fills max_len,
+            # making prompt_len == max_len → all labels masked → rejected.
             prompt_only_enc = processor(
                 text=prompt_text, images=[image],
-                return_tensors=None, truncation=True, max_length=max_len,
+                return_tensors=None, truncation=False,
             )
-            # ── FIX: unwrap [[ids...]] → [ids...] before measuring length ──
             prompt_ids = self._unwrap_token_ids(prompt_only_enc["input_ids"])
             prompt_len = len(prompt_ids)
-     
+            tok = getattr(processor, "tokenizer", processor)
+            if prompt_len >= max_len:
+                raise ValueError(
+                    f"Phi-3.5 expanded prompt is {prompt_len} tokens >= max_seq_len={max_len}."
+                )
             enc = processor(
                 text=full_text, images=[image],
                 return_tensors=None, padding="max_length",
                 truncation=True, max_length=max_len,
             )
-            tok = getattr(processor, "tokenizer", processor)
         else:
             tok = getattr(processor, "tokenizer", processor)
             prompt_text = f"<|user|>\n{question}<|end|>\n<|assistant|>\n"
             full_text   = f"{prompt_text}{answer}<|end|>"
-     
             prompt_only_enc = tok(
-                prompt_text, return_tensors=None,
-                truncation=True, max_length=max_len,
+                prompt_text, return_tensors=None, truncation=False,
             )
-            # ── FIX: unwrap here too for consistency ──
             prompt_ids = self._unwrap_token_ids(prompt_only_enc["input_ids"])
             prompt_len = len(prompt_ids)
-     
             enc = tok(
                 full_text, return_tensors=None, padding="max_length",
                 truncation=True, max_length=max_len,
