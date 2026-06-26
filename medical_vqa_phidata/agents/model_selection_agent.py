@@ -412,9 +412,15 @@ class ModelSelectionAgent:
                     logger.debug(f"[ModelSelection] Excluded (OOM headroom vs total {vram_total:.1f}GB): {m['hf_id']}")
                     continue
 
+            # FIX: apply 75% headroom on ALL selections, not just OOM retries.
+            # instructblip-7B needs 14.0 GB but T4 has 14.6 GB total — loading
+            # succeeds (14.6 >= 14.0) but leaves 0 GB for LoRA + activations
+            # → OOM on first training step every time. A 75% headroom budget
+            # (10.95 GB) correctly excludes it and picks Qwen (6.0 GB) instead.
+            safe_vram = vram_total * 0.75
             ok = (
                 True if device == "cpu"
-                else (vram_total >= m["min_vram"] or vram_total >= m["min_vram_4bit"])
+                else (safe_vram >= m["min_vram"] or safe_vram >= m["min_vram_4bit"])
             )
             if not ok:
                 continue
