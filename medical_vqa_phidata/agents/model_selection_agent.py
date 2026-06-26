@@ -236,10 +236,17 @@ class ModelSelectionAgent:
             "epochs":         5 if dataset_size < 500 else 3,
             "learning_rate":  2e-4,
 
-            # Feature engineering — family-aware seq len (vision models need >> 128)
+            # Feature engineering — family-aware seq len.
+            # FIX: vision models MUST be >> 512:
+            #   LLaVA-1.5 expands <image> to 576 patch tokens at 336px.
+            #   With max_seq_len=512, every record was skipped (prompt alone
+            #   = ~597 tokens > 512) → dataset empty → training never started.
+            #   Phi-3.5-vision expands to ~257 image tokens → ~777 total.
+            #   1024 fits LLaVA and Phi comfortably. Qwen-VL's
+            #   _resolve_effective_max_len() auto-raises if still too small.
             "max_seq_len":    {
-                "qwen_vl": 512, "phi_vision": 512, "llava": 512,
-                "instructblip": 256, "blip2": 256, "idefics": 512,
+                "qwen_vl": 1024, "phi_vision": 1024, "llava": 1024,
+                "instructblip": 512, "blip2": 512, "idefics": 1024,
                 "flan_t5": 128, "seq2seq": 128, "causal": 256,
             }.get(family, 256),
 
