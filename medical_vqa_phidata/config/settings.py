@@ -65,25 +65,32 @@ FREE_DATASETS = [
 # ── Model catalogue (all freely accessible, no HF login required) ─────────────
 MODEL_CATALOGUE = [
     {
-        "name":           "Qwen2.5-VL-3B",
-        "hf_id":          "Qwen/Qwen2.5-VL-3B-Instruct",
-        "vision":         True,
-        "params_b":       3.0,
-        "min_vram":       6.0,
-        "min_vram_4bit":  3.5,
-        "quality":        0.80,
-        "target_modules": ["q_proj", "v_proj"],
-        "architecture":   "causal",
-        "loader":         "AutoModelForVision2Seq",
-    },
-    {
+        # Qwen2-VL-2B: 2B params, ~4.5GB fp16 weights.
+        # On T4 (14.6GB): weights=4.5GB + LoRA=0.2GB + activations(batch=1,seq=512)=~2GB
+        # = ~6.7GB total -> 7.9GB headroom. Trains reliably on a single T4.
         "name":           "Qwen2-VL-2B",
         "hf_id":          "Qwen/Qwen2-VL-2B-Instruct",
         "vision":         True,
         "params_b":       2.0,
         "min_vram":       5.0,
         "min_vram_4bit":  3.0,
-        "quality":        0.74,
+        "quality":        0.78,
+        "target_modules": ["q_proj", "v_proj"],
+        "architecture":   "causal",
+        "loader":         "AutoModelForVision2Seq",
+    },
+    {
+        # Qwen2.5-VL-3B: 3B params, ~7.5GB fp16 weights.
+        # SAFE at seq_len=512 with gradient_checkpointing: ~11GB total, 3.6GB headroom.
+        # FAILS at seq_len=1024: activations ~7GB -> total ~15GB -> OOM on T4.
+        # min_vram raised from 6.0 to 8.0 to reflect real training floor.
+        "name":           "Qwen2.5-VL-3B",
+        "hf_id":          "Qwen/Qwen2.5-VL-3B-Instruct",
+        "vision":         True,
+        "params_b":       3.0,
+        "min_vram":       8.0,
+        "min_vram_4bit":  4.5,
+        "quality":        0.80,
         "target_modules": ["q_proj", "v_proj"],
         "architecture":   "causal",
         "loader":         "AutoModelForVision2Seq",
