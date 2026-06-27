@@ -88,8 +88,9 @@ from pathlib import Path
 # Trainer are ever imported anywhere in the process.
 os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 os.environ.setdefault("NCCL_IB_DISABLE",  "1")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
-# Reduce CUDA memory fragmentation after prior OOM events.
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"   # force unconditionally — do NOT use setdefault;
+                                             # Kaggle sets this to "0,1" for dual-T4 nodes
+                                             # and setdefault would leave it as "0,1".
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 logger = logging.getLogger(__name__)
@@ -1084,7 +1085,7 @@ class TrainingAgent:
             per_device_train_batch_size=batch_size,
             per_device_eval_batch_size=max(1, batch_size // 2),
             learning_rate=lr, fp16=use_fp16, bf16=use_bf16,
-            gradient_accumulation_steps=4 if batch_size <= 2 else 2,
+            gradient_accumulation_steps=8 if batch_size == 1 else (4 if batch_size == 2 else 2),
             warmup_steps=warmup_steps, weight_decay=0.01,
             logging_steps=logging_steps, eval_strategy="epoch", save_strategy="epoch",
             load_best_model_at_end=True, metric_for_best_model="eval_loss",
