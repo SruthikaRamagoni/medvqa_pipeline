@@ -202,12 +202,11 @@ class TrainingAgent:
             # NCCL errors are environment-setup failures, not model failures.
             # The module-level env var fix means retrying the same model will
             # succeed. Do NOT add the model to failed_models or change family.
-            if canonical_reason == "nccl_error":
+            if canonical_reason in ("nccl_error", "config_error"):
                 logger.warning(
-                    f"[Training] NCCL error on attempt {attempt} for "
-                    f"{failed_hf_id} — this is a P2P/IB env issue, not a "
-                    f"model failure. NCCL_P2P_DISABLE and NCCL_IB_DISABLE "
-                    f"are already set; retrying same model."
+                    f"[Training] {canonical_reason} on attempt {attempt} for "
+                    f"{failed_hf_id} — this is a code/env issue, not a model "
+                    f"failure. Retrying same model after fix."
                 )
             else:
                 if failed_hf_id and failed_hf_id not in failed_models:
@@ -231,12 +230,12 @@ class TrainingAgent:
             # _build_trainer will prevent NCCL from being re-initialized.
             # Re-encoding features for the same model is wasteful (5+ min)
             # and unnecessary — the features are correct.
-            if canonical_reason == "nccl_error":
+            if canonical_reason in ("nccl_error", "config_error"):
                 logger.info(
-                    f"[Training] NCCL retry {attempt+1}: reusing existing "
-                    f"features at {current_feature_path}, same model."
+                    f"[Training] {canonical_reason} retry {attempt+1}: "
+                    f"reusing existing features, same model."
                 )
-                continue  # jump straight to next _train_once with same plan/path
+                continue
 
             # ── Recall ModelSelectionAgent ───────────────────────────────────
             logger.info(
@@ -478,14 +477,15 @@ class TrainingAgent:
     def _classify_failure(self, message: str) -> str:
         """Maps a free-text error onto a canonical failure_reason code."""
         m = (message or "").lower()
-        # NCCL errors must be classified before oom — "cuda error" appears in
-        # both, but NCCL errors are a training-setup issue (P2P disabled env
-        # vars not set early enough), not an out-of-memory issue. Classifying
-        # them as "oom" causes the retry to exclude the entire qwen_vl family
-        # permanently, which is wrong — the model fits fine, the NCCL env var
-        # fix (module-level setdefault in this file) will prevent recurrence.
+        # NCCL errors before oom — both contain "cuda error"
         if any(k in m for k in ("nccl error", "nccl_error", "unhandled cuda error")):
             return "nccl_error"
+        # API/config errors: wrong kwargs, removed arguments, version mismatches.
+        # These are code bugs, not model failures — do NOT exclude the model family.
+        if any(k in m for k in ("unexpected keyword argument", "got an unexpected",
+                                  "not a valid", "unrecognized argument",
+                                  "__init__() got")):
+            return "config_error"
         if any(k in m for k in ("out of memory", "oom", "cudaoutofmemory",
                                  "memory allocation", "unable to allocate")):
             return "oom"
@@ -1091,9 +1091,10 @@ class TrainingAgent:
             greater_is_better=False, remove_unused_columns=False,
             report_to="none", dataloader_num_workers=0,
             max_grad_norm=max_grad_norm, lr_scheduler_type=lr_scheduler,
-            # Force no-distributed: single process, single GPU, no DDP/NCCL.
-            no_cuda=False,
-            local_rank=-1,
+            # Force single-GPU, no distributed. use_cpu=False keeps CUDA on;
+            # CUDA_VISIBLE_DEVICES="0" (set above) prevents multi-GPU DDP.
+            # Note: no_cuda / local_rank were removed in transformers>=4.46.
+            use_cpu=False,
         )
 
         ver       = tuple(int(x) for x in transformers.__version__.split(".")[:2])
