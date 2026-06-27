@@ -493,7 +493,7 @@ class FeatureEngineeringAgent:
     # Adaptive: each family's ceiling is chosen to fit comfortably on T4-class
     # VRAM at the typical batch sizes ModelSelectionAgent picks.
     _MAX_LEN_CEILING: Dict[str, int] = {
-        "qwen_vl":    2048,
+        "qwen_vl":    512,   # CRITICAL: 1024 causes OOM on T4 for 3B model. 512 is safe.
         "phi_vision": 1024,  # num_crops=1 still produces ~780 tokens on high-res images;
                               # 1024 leaves ~244 tokens for the answer, which is ample for VQA.
         "llava":      1024,
