@@ -254,7 +254,15 @@ class ModelSelectionAgent:
             "target_modules": best["target_modules"],
 
             # Training
-            "batch_size":     1 if device == "cpu" else (2 if use_4bit else 4),
+            # batch_size=4 at max_seq_len=1024 for a 3B vision model consumes
+            # ~13-14 GB VRAM (weights 6 GB + activations/grads 7-8 GB).
+            # That leaves <1 GB headroom — any spike in image patch count
+            # causes OOM. Use batch_size=2 for vision models and compensate
+            # with gradient_accumulation_steps=4 (effective batch=8).
+            "batch_size":     1 if device == "cpu" else (
+                2 if (use_4bit or family in ("qwen_vl", "llava", "phi_vision", "idefics"))
+                else 4
+            ),
             "epochs":         5 if dataset_size < 500 else 3,
             "learning_rate":  2e-4,
 
