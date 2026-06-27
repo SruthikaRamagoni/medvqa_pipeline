@@ -267,18 +267,25 @@ class ModelSelectionAgent:
             "learning_rate":  2e-4,
 
             # Feature engineering — family-aware seq len.
-            # FIX: vision models MUST be >> 512:
-            #   LLaVA-1.5 expands <image> to 576 patch tokens at 336px → need >= 1024
-            #   Phi-3.5-vision: with num_crops=1 image tokens ~144 + question ~80 = ~224
-            #     prompt tokens → 512 is ample and keeps per-record tensor size small.
-            #     (Old value was 2048, based on default num_crops=4 which produced ~750
-            #      image tokens alone and caused mass record-skipping + OOM.)
-            #   Qwen-VL: dynamic patch count, 1024 is sufficient for most cases.
+            # KEY FIX — qwen_vl is now 512, NOT 1024:
+            #   At seq_len=1024, Qwen2.5-VL-3B activations consume ~7GB of VRAM,
+            #   pushing total (weights 7.5GB + LoRA 0.4GB + activations 7GB) to ~15GB,
+            #   which exceeds the T4's 14.6GB. OOM is guaranteed.
+            #   At seq_len=512, activations drop to ~3GB -> total ~11GB -> 3.6GB headroom.
+            #   VQA-RAD answers are short (yes/no, organ names), so 512 is more than enough.
+            #   Qwen2-VL-2B (now first pick) is even safer: ~4.5GB weights -> ~8GB total at 512.
+            #   Phi-3.5-vision: num_crops=1 keeps image tokens ~144, so 1024 is generous.
+            #   LLaVA-1.5: expands <image> to 576 patch tokens, needs >= 1024.
             "max_seq_len":    {
-                "qwen_vl": 1024, "phi_vision": 1024, "llava": 1024,
+                "qwen_vl": 512, "phi_vision": 1024, "llava": 1024,
                 "instructblip": 512, "blip2": 512, "idefics": 1024,
                 "flan_t5": 128, "seq2seq": 128, "causal": 256,
             }.get(family, 256),
+
+            # Gradient checkpointing: recompute activations during backward pass
+            # instead of storing them. Saves ~30-40% activation memory at the cost
+            # of ~20% slower training. Essential for vision models on T4 (14.6GB).
+            "gradient_checkpointing": family in ("qwen_vl", "phi_vision", "llava", "idefics"),
 
             # Retry bookkeeping
             "excluded_models": failed_models,
