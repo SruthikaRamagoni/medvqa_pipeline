@@ -88,6 +88,7 @@ from pathlib import Path
 # Trainer are ever imported anywhere in the process.
 os.environ.setdefault("NCCL_P2P_DISABLE", "1")
 os.environ.setdefault("NCCL_IB_DISABLE",  "1")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 # Reduce CUDA memory fragmentation after prior OOM events.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
@@ -224,6 +225,18 @@ class TrainingAgent:
                     f"{'max retries exhausted' if retries_left <= 0 else 'no processed_data_path supplied for regeneration'}."
                 )
                 return result
+
+            # ── NCCL error: retry same model+features, no re-selection ───────
+            # The process group teardown + CUDA_VISIBLE_DEVICES="0" in
+            # _build_trainer will prevent NCCL from being re-initialized.
+            # Re-encoding features for the same model is wasteful (5+ min)
+            # and unnecessary — the features are correct.
+            if canonical_reason == "nccl_error":
+                logger.info(
+                    f"[Training] NCCL retry {attempt+1}: reusing existing "
+                    f"features at {current_feature_path}, same model."
+                )
+                continue  # jump straight to next _train_once with same plan/path
 
             # ── Recall ModelSelectionAgent ───────────────────────────────────
             logger.info(
@@ -377,6 +390,31 @@ class TrainingAgent:
             train_loss = round(float(metrics.get("train_loss", 0.0)), 4)
         except Exception as e:
             logger.error(f"[Training] Training failed: {e}")
+            # ── Explicit cleanup — CRITICAL for retry attempts ────────────────
+            # Without this, the 7.5 GB Qwen model stays on GPU after failure.
+            # The next retry then loads another copy → immediate OOM before
+            # training even starts. Delete model, trainer, and flush CUDA cache.
+            try:
+                del trainer
+            except Exception:
+                pass
+            try:
+                del model
+            except Exception:
+                pass
+            try:
+                import torch, gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    free_gb = torch.cuda.mem_get_info()[0] / 1e9
+                    logger.info(
+                        f"[Training] GPU cache cleared after failure "
+                        f"(free={free_gb:.2f}GB)"
+                    )
+            except Exception:
+                pass
             return self._fail(
                 f"Training loop error: {e}",
                 model_used=hf_id, checkpoint_path=str(out_dir),
@@ -1012,9 +1050,25 @@ class TrainingAgent:
         import transformers
         from transformers import TrainingArguments, Trainer, EarlyStoppingCallback, default_data_collator
 
-        # NCCL env vars are set at module import time (top of this file)
-        # to ensure they're in place before any CUDA/torch init occurs.
-        # The setdefault calls that used to live here have been moved there.
+        # ── Destroy any stale NCCL process group ─────────────────────────────
+        # After an NCCL failure, torch.distributed holds a broken process
+        # group. Calling init_process_group again without destroying first
+        # raises "already initialized" errors. Destroying it here before
+        # building the Trainer means the next Trainer.__init__ starts clean.
+        try:
+            import torch.distributed as dist
+            if dist.is_available() and dist.is_initialized():
+                dist.destroy_process_group()
+                logger.info("[Training] Destroyed stale torch.distributed process group.")
+        except Exception as e:
+            logger.debug(f"[Training] dist.destroy_process_group skipped: {e}")
+
+        # ── Force single-GPU, no distributed ─────────────────────────────────
+        # CUDA_VISIBLE_DEVICES="0" ensures Trainer sees exactly one GPU and
+        # never attempts to launch a distributed process group. Combined with
+        # the module-level NCCL_P2P_DISABLE / NCCL_IB_DISABLE env vars, this
+        # prevents NCCL from being invoked at all on T4 Kaggle nodes.
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
         use_fp16 = precision == "fp16" and torch.cuda.is_available()
         use_bf16 = False
@@ -1037,6 +1091,9 @@ class TrainingAgent:
             greater_is_better=False, remove_unused_columns=False,
             report_to="none", dataloader_num_workers=0,
             max_grad_norm=max_grad_norm, lr_scheduler_type=lr_scheduler,
+            # Force no-distributed: single process, single GPU, no DDP/NCCL.
+            no_cuda=False,
+            local_rank=-1,
         )
 
         ver       = tuple(int(x) for x in transformers.__version__.split(".")[:2])
