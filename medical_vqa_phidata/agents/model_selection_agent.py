@@ -184,12 +184,12 @@ class ModelSelectionAgent:
         response  = self.agent.run(prompt)
 
         # On retry: allow LLM to flag a better alternative from the scored list
-        # (e.g. it notices scored[0] shares a family with a failed model).
-        # CRITICAL: only accept hf_ids that actually exist in scored — the LLM
-        # can hallucinate model names from its training data (e.g. Phi-3.5 even
-        # after it was removed from the catalogue). If the LLM pick is not in
-        # scored, silently fall back to scored[0].
-        if failed_models:
+        # ONLY for structural failures (tensor shape, processor issues) where
+        # the LLM might have architecture-level insight.
+        # For OOM failures, the scorer's VRAM-aware ranking is more reliable
+        # than the LLM — the LLM consistently hallucinates Phi-3.5 which is
+        # not in the catalogue and has higher VRAM requirements than alternatives.
+        if failed_models and failure_class != "oom":
             llm_hf_id = self._parse_response(response)
             scored_hf_ids = {m["hf_id"].lower() for m in scored}
             if llm_hf_id and llm_hf_id.lower() in scored_hf_ids:
@@ -254,14 +254,14 @@ class ModelSelectionAgent:
             "target_modules": best["target_modules"],
 
             # Training
-            # batch_size=4 at max_seq_len=1024 for a 3B vision model consumes
-            # ~13-14 GB VRAM (weights 6 GB + activations/grads 7-8 GB).
-            # That leaves <1 GB headroom — any spike in image patch count
-            # causes OOM. Use batch_size=2 for vision models and compensate
-            # with gradient_accumulation_steps=4 (effective batch=8).
-            "batch_size":     1 if device == "cpu" else (
-                2 if (use_4bit or family in ("qwen_vl", "llava", "phi_vision", "idefics"))
-                else 4
+            # Qwen2.5-VL-3B on T4 (14.6 GB):
+            #   weights ~7.5 GB + LoRA grads ~0.5 GB = ~8 GB baseline
+            #   activations at batch=2, seq=1024: ~6-7 GB → total > 14.6 GB → OOM
+            #   batch=1 reduces activations to ~3 GB → total ~11.5 GB → fits with headroom
+            #   Compensate with gradient_accumulation_steps=8 (effective batch=8).
+            "batch_size": 1 if device == "cpu" else (
+                1 if family in ("qwen_vl", "llava", "phi_vision", "idefics")
+                else (2 if use_4bit else 4)
             ),
             "epochs":         5 if dataset_size < 500 else 3,
             "learning_rate":  2e-4,
