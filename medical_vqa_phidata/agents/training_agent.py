@@ -365,6 +365,14 @@ class TrainingAgent:
                 f"will use patch-concatenation collator."
             )
 
+        # Honor gradient_checkpointing from model_plan (set by ModelSelectionAgent
+        # for memory-intensive vision families). Falls back to True for qwen_vl/phi
+        # even if not in plan, since they would OOM on T4 without it.
+        _gc_families = {"qwen_vl", "phi_vision", "llava", "idefics"}
+        _family = active_plan.get("model_family", "") or ""
+        use_grad_ckpt = active_plan.get("gradient_checkpointing",
+                                         _family in _gc_families or is_qwen_vl)
+
         safe_name = name.replace(" ", "_").replace("/", "_")
         out_dir   = CHECKPOINT_DIR / safe_name
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -385,6 +393,7 @@ class TrainingAgent:
                 precision, device,
                 max_grad_norm=max_grad_norm, es_patience=es_patience,
                 lr_scheduler=lr_scheduler, hf_id=hf_id,
+                gradient_checkpointing=use_grad_ckpt,
             )
             metrics    = self._run_training(trainer)
             train_loss = round(float(metrics.get("train_loss", 0.0)), 4)
@@ -867,7 +876,6 @@ class TrainingAgent:
                     fn()
                 except Exception:
                     pass
-
         tokenizer = None
         try:
             from transformers import AutoProcessor
@@ -1046,6 +1054,7 @@ class TrainingAgent:
         self, model, tok, train_ds, val_ds, out_dir, batch_size, epochs, lr,
         precision, device, max_grad_norm: float = 1.0, es_patience: int = 2,
         lr_scheduler: str = "cosine", hf_id: str = "",
+        gradient_checkpointing: bool = False,
     ):
         import os, torch
         import transformers
@@ -1080,21 +1089,26 @@ class TrainingAgent:
         warmup_steps    = min(100, max(1, steps_per_epoch // 10))
         logging_steps   = max(1, steps_per_epoch // 5)
 
+        # Gradient accumulation: compensate for tiny physical batch size.
+        # qwen_vl/phi_vision/llava must use batch=1 to fit on T4, so we
+        # accumulate more steps to keep effective batch size = 8-16.
+        # batch=1 -> accum=16 (effective=16), batch=2 -> accum=8 (effective=16),
+        # batch=4 -> accum=4 (effective=16). Always positive integer.
+        grad_accum = max(1, 16 // max(1, batch_size))
+
         args = TrainingArguments(
             output_dir=out_dir, num_train_epochs=epochs,
             per_device_train_batch_size=batch_size,
             per_device_eval_batch_size=max(1, batch_size // 2),
             learning_rate=lr, fp16=use_fp16, bf16=use_bf16,
-            gradient_accumulation_steps=8 if batch_size == 1 else (4 if batch_size == 2 else 2),
+            gradient_accumulation_steps=grad_accum,
+            gradient_checkpointing=gradient_checkpointing,
             warmup_steps=warmup_steps, weight_decay=0.01,
             logging_steps=logging_steps, eval_strategy="epoch", save_strategy="epoch",
             load_best_model_at_end=True, metric_for_best_model="eval_loss",
             greater_is_better=False, remove_unused_columns=False,
             report_to="none", dataloader_num_workers=0,
             max_grad_norm=max_grad_norm, lr_scheduler_type=lr_scheduler,
-            # Force single-GPU, no distributed. use_cpu=False keeps CUDA on;
-            # CUDA_VISIBLE_DEVICES="0" (set above) prevents multi-GPU DDP.
-            # Note: no_cuda / local_rank were removed in transformers>=4.46.
             use_cpu=False,
         )
 
