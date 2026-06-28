@@ -170,7 +170,19 @@ class DataCollectionAgent:
         return records[:self.max_samples]
 
     def _unify_schema(self, records: List[Dict], modality: str) -> List[Dict]:
-        """Normalize arbitrary field names to standard VQA schema."""
+        """Normalize arbitrary field names to standard VQA schema.
+        
+        FIX: Previously only 5 fields were kept (image_path, question, answer,
+        split, modality). All other metadata — including answer_type (CLOSED/OPEN
+        in VQA-RAD), image_organ, image_name — were silently dropped.
+        
+        answer_type is specifically important because:
+        - It identifies yes/no questions (CLOSED) vs open-ended (OPEN)
+        - Downstream agents need it for answer balancing
+        - EvaluationAgent needs it to compute per-type accuracy breakdowns
+        
+        Now all original fields are preserved alongside the normalised ones.
+        """
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         unified = []
         for i, rec in enumerate(records):
@@ -195,13 +207,31 @@ class DataCollectionAgent:
             if not question or not answer:
                 continue
 
+            # Preserve ALL original metadata fields that may be useful downstream.
+            # Specifically for VQA-RAD: answer_type (CLOSED/OPEN), image_organ,
+            # image_name, image_id — these are used for per-type accuracy and
+            # answer balancing. Never silently drop dataset-provided metadata.
+            extra = {}
+            preserved_keys = [
+                "answer_type", "image_organ", "image_name", "image_id",
+                "question_type", "content_type", "phrase_type",
+                "qid", "question_id", "uid",
+            ]
+            for key in preserved_keys:
+                if key in rec and rec[key] is not None:
+                    extra[key] = rec[key]
+
             unified.append({
                 "image_path": image_path,
-                "question": question,
-                "answer": answer,
-                "split": split,
-                "modality": modality,
+                "question":   question,
+                "answer":     answer,
+                "split":      split,
+                "modality":   modality,
+                **extra,
             })
+
+        logger.info(f"[DataCollection] Unified {len(unified)} valid records.")
+        return unified
 
         logger.info(f"[DataCollection] Unified {len(unified)} valid records.")
         return unified
