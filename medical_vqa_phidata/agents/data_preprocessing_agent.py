@@ -64,6 +64,30 @@ class DataPreprocessingAgent:
         records = [json.loads(l) for l in open(raw_data_path) if l.strip()]
         logger.info(f"[Preprocessing] Loaded {len(records)} raw records.")
 
+        # ── Modality filter (NEW) ────────────────────────────────────────────
+        # VQA-RAD mixes CT, MRI, and chest X-ray images. Training on all
+        # modalities dilutes domain-specific learning. When MODALITY_FILTER
+        # is set (e.g. "mri"), only records whose image_type / modality field
+        # matches are kept. This is opt-in (empty string = no filtering).
+        try:
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            from config.settings import MODALITY_FILTER
+        except Exception:
+            MODALITY_FILTER = ""
+        if MODALITY_FILTER:
+            mf = MODALITY_FILTER.lower()
+            before = len(records)
+            records = [
+                r for r in records
+                if mf in (r.get("image_type") or r.get("modality") or "").lower()
+                or mf in (r.get("question") or "").lower()
+            ]
+            logger.info(
+                f"[Preprocessing] Modality filter '{MODALITY_FILTER}': "
+                f"{len(records)}/{before} records kept."
+            )
+
         # Step 1: Repair image paths
         records = self._repair_paths(records, str(Path(raw_data_path).parent.parent))
 
