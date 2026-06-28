@@ -187,11 +187,10 @@ class FeatureEngineeringAgent:
             # v4: qwen_vl effective max_len auto-resolution (image-token
             #     expansion could make prompt_len saturate at max_len,
             #     masking 100% of labels when max_seq_len was too small).
-            # v6: num_crops=1 for phi_vision (cuts image tokens ~750→~144),
-            #     adaptive max_len probe extended to ALL vision families
-            #     (was qwen_vl-only), _encode_phi_vision now auto-resizes
-            #     effective_max_len per-record instead of skipping.
-            "label_masking_version": 6,
+            # v7: data_preprocessing_agent no longer downsizes images to 224×224.
+            #     Images now reach the processor at their original resolution.
+            #     Caches from v6 were encoded from 224×224 thumbnails — discard them.
+            "label_masking_version": 7,
         }
 
         feature_path = self._feature_path_for(hf_id, model_family)
@@ -392,14 +391,9 @@ class FeatureEngineeringAgent:
 
     # ── Processor loading ─────────────────────────────────────────────────────
 
-    # Per-family processor kwargs. num_crops=1 for phi_vision cuts image tokens
-    # from ~750 (4 crops × ~144 + overhead) down to ~144, so the prompt fits
-    # comfortably within max_seq_len=512 and almost no records are skipped.
-    # Values here are merged into AutoProcessor.from_pretrained kwargs at load
-    # time; add entries for any future family that needs non-default settings.
-    _PROCESSOR_KWARGS: Dict[str, Dict[str, Any]] = {
-        "phi_vision": {"num_crops": 1},
-    }
+    # Per-family processor kwargs merged into AutoProcessor.from_pretrained at
+    # load time. Add entries here for any family needing non-default settings.
+    _PROCESSOR_KWARGS: Dict[str, Dict[str, Any]] = {}
 
     def _load_processor(self, hf_id: str, model_family: str):
         processor = None
@@ -488,21 +482,19 @@ class FeatureEngineeringAgent:
 
     # ── Encoding ──────────────────────────────────────────────────────────────
 
-    # Hard ceiling per family — prevents a single very long record from
+    # Hard ceiling per family. Prevents a single very long record from
     # inflating max_len to something that causes OOM during training.
-    # Adaptive: each family's ceiling is chosen to fit comfortably on T4-class
-    # VRAM at the typical batch sizes ModelSelectionAgent picks.
+    # Values are chosen to fit comfortably on T4-class VRAM at typical batch sizes.
+    # Add/update entries here when adding new model families to MODEL_CATALOGUE.
     _MAX_LEN_CEILING: Dict[str, int] = {
-        "qwen_vl":    512,   # CRITICAL: 1024 causes OOM on T4 for 3B model. 512 is safe.
-        "phi_vision": 1024,  # num_crops=1 still produces ~780 tokens on high-res images;
-                              # 1024 leaves ~244 tokens for the answer, which is ample for VQA.
-        "llava":      1024,
-        "instructblip": 512,
-        "blip2":       512,
-        "idefics":    1024,
-        "flan_t5":     256,
-        "seq2seq":     256,
-        "causal":      512,
+        "qwen_vl":      1024,
+        "llava":        1024,
+        "instructblip":  512,
+        "blip2":         512,
+        "idefics":      1024,
+        "flan_t5":       256,
+        "seq2seq":       256,
+        "causal":        512,
     }
     _DEFAULT_MAX_LEN_CEILING = 1024
 
