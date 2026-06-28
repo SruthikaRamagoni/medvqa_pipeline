@@ -248,8 +248,9 @@ class ModelSelectionAgent:
             "precision":      "fp32" if device == "cpu" else "fp16",
 
             # LoRA
-            "lora_r":         8  if dataset_size < 1000 else 16,
-            "lora_alpha":     16 if dataset_size < 1000 else 32,
+            "lora_r":         32,   # FIX: r=8/16 underfit on VQA-RAD; r=32 doubles
+                                       # LoRA capacity for ~0.2GB extra VRAM on T4.
+            "lora_alpha":     64,   # FIX: alpha=2*r is the standard LoRA scaling convention.
             "lora_dropout":   0.05,
             "target_modules": best["target_modules"],
 
@@ -263,7 +264,7 @@ class ModelSelectionAgent:
                 1 if family in ("qwen_vl", "llava", "phi_vision", "idefics")
                 else (2 if use_4bit else 4)
             ),
-            "epochs":         5 if dataset_size < 500 else 3,
+            "epochs":         8,   # FIX: 3 epochs produced train_loss=6.89 (underfitting); 8 epochs needed for convergence.
             "learning_rate":  2e-4,
 
             # Feature engineering — family-aware seq len.
