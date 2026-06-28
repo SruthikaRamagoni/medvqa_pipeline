@@ -19,15 +19,22 @@ MAX_SEQ_LEN        = 1024   # Phi-3.5-vision with num_crops=1 still produces ~78
 
 # ── Training ──────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR     = os.getenv("CHECKPOINT_DIR", "./artifacts/checkpoints")
-DEFAULT_LORA_R     = 8
-DEFAULT_LORA_ALPHA = 16
-DEFAULT_EPOCHS     = 3
+DEFAULT_LORA_R     = 32
+DEFAULT_LORA_ALPHA = 64
+DEFAULT_EPOCHS     = 8
 DEFAULT_BATCH      = 4
-DEFAULT_LR         = 2e-4
+DEFAULT_LR         = 2e-4  # unchanged — already optimal for LoRA
 MAX_MODEL_RETRIES  = 3
 # ── Evaluation ────────────────────────────────────────────────────────────────
 EVAL_DIR     = os.getenv("EVAL_DIR",    "./artifacts/evaluation")
 EVAL_SAMPLES = int(os.getenv("EVAL_SAMPLES", "200"))
+
+# ── Accuracy improvements ─────────────────────────────────────────────────────
+# Constrain yes/no questions to only output "yes" or "no" at generation time.
+BINARY_CONSTRAINED_DECODING = os.getenv("BINARY_CONSTRAINED_DECODING", "1") == "1"
+# Filter training data to a specific modality (empty = use all).
+MODALITY_FILTER = os.getenv("MODALITY_FILTER", "")  # e.g. "mri", "ct", "x-ray"
+
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 LOG_DIR   = "./logs"
