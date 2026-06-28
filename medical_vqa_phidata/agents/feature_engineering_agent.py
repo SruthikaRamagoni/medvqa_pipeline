@@ -337,20 +337,30 @@ class FeatureEngineeringAgent:
         train_out.mkdir(parents=True, exist_ok=True)
         val_out.mkdir(parents=True, exist_ok=True)
 
-        # Read shard sizes without loading pixel data into RAM
-        shard_sizes = []
-        for sp in shard_paths:
-            try:
-                info_file = Path(sp) / "dataset_info.json"
-                if info_file.exists():
-                    shard_sizes.append(_json.loads(info_file.read_text()).get("num_rows", 0))
-                else:
-                    # Fall back: load just metadata
-                    ds_tmp = load_from_disk(sp)
-                    shard_sizes.append(len(ds_tmp))
-                    del ds_tmp
-            except Exception:
-                shard_sizes.append(0)
+        # Read shard sizes from Arrow stream headers — zero pixel data loaded.
+        # dataset_info.json does NOT contain num_rows (it only has schema/features),
+        # and state.json has no _num_rows either. The row count lives in the Arrow
+        # IPC stream file itself, readable in microseconds via open_stream().
+        import pyarrow as _pa
+        import glob as _glob
+
+        def _count_arrow_rows(shard_path: str) -> int:
+            """Count rows in a shard by scanning Arrow stream headers only."""
+            arrow_files = sorted(_glob.glob(str(Path(shard_path) / "*.arrow")))
+            if not arrow_files:
+                return 0
+            total = 0
+            for af in arrow_files:
+                try:
+                    with _pa.memory_map(af, "r") as src:
+                        reader = _pa.ipc.open_stream(src)
+                        total += sum(b.num_rows for b in reader)
+                except Exception as e:
+                    logger.debug(f"[FeatureEng] Arrow row count failed for {af}: {e}")
+            return total
+
+        shard_sizes = [_count_arrow_rows(sp) for sp in shard_paths]
+        logger.info(f"[FeatureEng] Shard sizes (from Arrow headers): {shard_sizes}")
 
         total_n    = sum(shard_sizes)
         split_at   = max(1, int(total_n * 0.9))
@@ -665,6 +675,9 @@ class FeatureEngineeringAgent:
     _MAX_LEN_CEILING: Dict[str, int] = {
         "qwen_vl":      512,   # FIX: 1024 caused image-token mismatch (patch tokens > max_length);
                                   # 512 fits within T4 VRAM and avoids mid-image truncation.
+        "phi_vision":   640,   # FIX: at 1024 the Phi-3.5 prompt alone consumes 774-781 tokens,
+                                  # leaving only 2-3 for the answer → all records skipped.
+                                  # 640 caps the prompt, preserving ≥60 tokens for answers.
         "llava":        1024,
         "instructblip":  512,
         "blip2":         512,
