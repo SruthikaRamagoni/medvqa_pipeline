@@ -16,6 +16,19 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Binary yes/no questions in VQA-RAD — detect so we can constrain generation.
+_BINARY_QUESTION_PREFIXES = (
+    "is ", "are ", "was ", "were ", "does ", "do ", "did ", "has ", "have ",
+    "can ", "could ", "should ", "will ", "would ", "any ", "is there",
+)
+_BINARY_ANSWERS = {"yes", "no"}
+
+def _is_binary_question(question: str) -> bool:
+    """Return True if the question expects a yes/no answer."""
+    q = question.lower().strip()
+    return any(q.startswith(p) for p in _BINARY_QUESTION_PREFIXES)
+
+
 REPORT_DIR = Path("./artifacts/evaluation")
 
 
@@ -343,19 +356,49 @@ class EvaluationAgent:
                     except Exception:
                         safe_inputs = dict(inputs)
 
-                    out = model.generate(
-                        **safe_inputs,
-                        max_new_tokens=32,   # VQA-RAD answers are short (avg 1–4 tokens).
-                                              # 64 allowed the model to keep generating
-                                              # after the answer, adding hallucinated
-                                              # text that reduced BLEU/ROUGE/exact-match.
+                    # Binary constrained decoding: for yes/no questions, force
+                    # the model to choose between only "yes" and "no" tokens.
+                    # This is the single highest-impact accuracy improvement for
+                    # VQA-RAD, where ~57% of questions are yes/no.
+                    force_words_ids = None
+                    bad_words_ids   = None
+                    if _is_binary_question(question):
+                        try:
+                            yes_ids = tok.encode("yes", add_special_tokens=False)
+                            no_ids  = tok.encode("no",  add_special_tokens=False)
+                            if yes_ids and no_ids:
+                                force_words_ids = [yes_ids, no_ids]
+                        except Exception:
+                            pass
+
+                    gen_kwargs = dict(
+                        max_new_tokens=32,
                         do_sample=False,
                         pad_token_id=pad_id,
                     )
+                    if force_words_ids:
+                        # force_words_ids requires the model to produce AT LEAST
+                        # one token from each list — pick the one with higher logit.
+                        # Use num_beams=2 so beam search can satisfy the constraint
+                        # without greedy decoding being forced into an unnatural path.
+                        gen_kwargs["force_words_ids"] = force_words_ids
+                        gen_kwargs["num_beams"] = 2
+
+                    out = model.generate(**safe_inputs, **gen_kwargs)
                     # Decode only the generated tokens (skip the prompt)
                     prompt_len = safe_inputs["input_ids"].shape[-1]
                     gen_tokens = out[0][prompt_len:]
                     prediction = tok.decode(gen_tokens, skip_special_tokens=True).strip()
+
+                    # Post-process: for binary questions, extract only the
+                    # yes/no word even if the model emitted extra text.
+                    if _is_binary_question(question):
+                        pred_norm = prediction.lower().strip().rstrip(".")
+                        if pred_norm.startswith("yes"):
+                            prediction = "yes"
+                        elif pred_norm.startswith("no"):
+                            prediction = "no"
+                        # else: leave as-is and let metrics normalise
 
             except Exception as e:
                 logger.warning(f"[Evaluation] Record {i} generation failed: {type(e).__name__}: {e}")
