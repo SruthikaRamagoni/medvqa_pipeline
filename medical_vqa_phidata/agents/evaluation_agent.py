@@ -345,7 +345,10 @@ class EvaluationAgent:
 
                     out = model.generate(
                         **safe_inputs,
-                        max_new_tokens=64,
+                        max_new_tokens=32,   # VQA-RAD answers are short (avg 1–4 tokens).
+                                              # 64 allowed the model to keep generating
+                                              # after the answer, adding hallucinated
+                                              # text that reduced BLEU/ROUGE/exact-match.
                         do_sample=False,
                         pad_token_id=pad_id,
                     )
@@ -387,6 +390,10 @@ class EvaluationAgent:
             "medical_accuracy": round(med_acc, 4), "n_samples": len(results),
         }
 
+    def _normalise(self, s: str) -> str:
+        """Normalise text before metric computation — remove punctuation, lowercase, collapse whitespace."""
+        return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", s.lower())).strip()
+
     def _bleu(self, preds, refs):
         try:
             import nltk
@@ -394,8 +401,11 @@ class EvaluationAgent:
             try: nltk.data.find("tokenizers/punkt")
             except: nltk.download("punkt", quiet=True)
             sf = SmoothingFunction().method1
-            b1 = [sentence_bleu([r.split()], p.split(), (1,0,0,0), sf) for p,r in zip(preds,refs)]
-            b4 = [sentence_bleu([r.split()], p.split(), (.25,.25,.25,.25), sf) for p,r in zip(preds,refs)]
+            # FIX: normalise before tokenising — "Yes." vs "yes" should match.
+            np_ = [self._normalise(p) for p in preds]
+            nr  = [self._normalise(r) for r in refs]
+            b1 = [sentence_bleu([r.split()], p.split(), (1,0,0,0), sf) for p,r in zip(np_,nr)]
+            b4 = [sentence_bleu([r.split()], p.split(), (.25,.25,.25,.25), sf) for p,r in zip(np_,nr)]
             return sum(b1)/max(len(b1),1), sum(b4)/max(len(b4),1)
         except Exception:
             return 0.0, 0.0
@@ -404,31 +414,42 @@ class EvaluationAgent:
         try:
             from rouge_score import rouge_scorer
             scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
-            scores = [scorer.score(r, p)["rougeL"].fmeasure for p,r in zip(preds,refs)]
+            # FIX: normalise before scoring.
+            np_ = [self._normalise(p) for p in preds]
+            nr  = [self._normalise(r) for r in refs]
+            scores = [scorer.score(r, p)["rougeL"].fmeasure for p,r in zip(np_,nr)]
             return sum(scores)/max(len(scores),1)
         except Exception:
+            np_ = [self._normalise(p) for p in preds]
+            nr  = [self._normalise(r) for r in refs]
             scores = []
-            for p, r in zip(preds, refs):
-                rw = set(r.lower().split()); pw = set(p.lower().split())
-                scores.append(len(rw&pw)/max(len(rw),1))
+            for p, r in zip(np_, nr):
+                rw = set(r.split()); pw = set(p.split())
+                scores.append(len(rw & pw)/max(len(rw),1))
             return sum(scores)/max(len(scores),1)
 
     def _exact_match(self, preds, refs):
-        def norm(s): return re.sub(r"\s+"," ", re.sub(r"[^\w\s]","", s.lower())).strip()
-        return sum(1 for p,r in zip(preds,refs) if norm(p)==norm(r)) / max(len(preds),1)
+        # FIX: use shared _normalise() for consistency across all metrics.
+        return sum(1 for p,r in zip(preds,refs)
+                   if self._normalise(p) == self._normalise(r)) / max(len(preds),1)
 
     def _medical_accuracy(self, preds, refs):
         MED = {"yes","no","normal","abnormal","present","absent","mild","moderate",
                "severe","acute","chronic","left","right","bilateral"}
         scores = []
         for p, r in zip(preds, refs):
-            rl, pl = r.lower().strip(), p.lower().strip()
+            # FIX: normalise before comparison — "Yes." vs "yes" previously scored 0.
+            rl, pl = self._normalise(r), self._normalise(p)
             if rl in {"yes","no"} and pl in {"yes","no"}:
-                scores.append(1.0 if rl==pl else 0.0); continue
+                scores.append(1.0 if rl == pl else 0.0)
+                continue
             rt, pt = set(rl.split()), set(pl.split())
-            ov = rt & pt; med_ov = ov & MED
-            scores.append(min((len(ov)+len(med_ov))/(len(rt)+len(med_ov)+1e-6), 1.0))
-        return sum(scores)/max(len(scores),1)
+            ov = rt & pt
+            med_ov = ov & MED
+            # FIX: denominator was len(rt)+len(med_ov)+eps which double-counted
+            # medical term matches. A perfect match (p==r) now correctly scores 1.0.
+            scores.append(min((len(ov) + len(med_ov)) / max(len(rt) + len(med_ov), 1), 1.0))
+        return sum(scores) / max(len(scores), 1)
 
     def _parse_response(self, response) -> Dict:
         try:
