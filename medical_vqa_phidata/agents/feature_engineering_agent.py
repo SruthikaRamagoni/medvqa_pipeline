@@ -233,24 +233,26 @@ class FeatureEngineeringAgent:
         max_len = self._resolve_effective_max_len(records, processor, model_family, max_len)
         self._last_encode_diagnostics = {}  # populated by the generator as it runs
 
+        # ── CHUNKED SHARD ENCODING (RAM-safe, flush every 250 records) ─────────
+        # Root cause of OOM: Dataset.from_generator accumulates ALL encoded
+        # records (including full pixel_values) as an Arrow table in /tmp or
+        # in-process memory before any byte hits disk. For Qwen2-VL at 2244
+        # records this peaks at ~25 GB RAM — more than the 30 GB available.
+        #
+        # Fix: encode in SHARD_SIZE chunks, call Dataset.from_list() on each
+        # small chunk (cheap — only 250 records in RAM at once), immediately
+        # save_to_disk() that shard to a numbered directory, then release it.
+        # After all shards are on disk, concatenate_datasets() reads them as
+        # memory-mapped Arrow files — zero additional RAM.
+        SHARD_SIZE = 250
+        shard_dir  = Path(feature_path) / "_shards"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+
         try:
-            from datasets import Dataset
-            from functools import partial
-            # IMPORTANT: do NOT pass `records` (a list) via gen_kwargs.
-            # Dataset.from_generator treats any list-valued gen_kwargs entry
-            # as a set of per-shard arguments and calls the generator ONCE
-            # PER ELEMENT of that list (this is meant for multiprocess
-            # sharding, e.g. gen_kwargs={"files": [f1, f2, ...]} -> one
-            # call per file). Passing our 2244-record list this way caused
-            # the generator to be invoked 2244 separate times, each with
-            # a single-record "records" list — exactly what produced the
-            # "Starting streaming encode over 1 records" spam repeated
-            # thousands of times in the logs instead of one real run.
-            # Binding everything via functools.partial (a closure) instead
-            # avoids gen_kwargs entirely, so `records` is passed through
-            # untouched as one full list to one single generator call.
-            gen = partial(
-                self._encode_records_gen,
+            from datasets import Dataset, concatenate_datasets
+            import gc, time as _time
+
+            gen_obj = self._encode_records_gen(
                 records=records,
                 processor=processor,
                 tokenizer=tokenizer,
@@ -259,11 +261,45 @@ class FeatureEngineeringAgent:
                 architecture=architecture,
                 max_len=max_len,
             )
-            full_ds = Dataset.from_generator(gen)
-        except Exception as e:
-            return self._fail(f"Streaming encode failed: {type(e).__name__}: {e}")
 
-        if len(full_ds) == 0:
+            shard_paths = []
+            chunk       = []
+            total_encoded = 0
+            shard_idx   = 0
+
+            for entry in gen_obj:
+                chunk.append(entry)
+                if len(chunk) >= SHARD_SIZE:
+                    shard_path = str(shard_dir / f"shard_{shard_idx:04d}")
+                    Dataset.from_list(chunk).save_to_disk(shard_path)
+                    shard_paths.append(shard_path)
+                    total_encoded += len(chunk)
+                    logger.info(
+                        f"[FeatureEng] Shard {shard_idx} flushed → "
+                        f"{shard_path} ({len(chunk)} records, "
+                        f"total={total_encoded})"
+                    )
+                    chunk = []
+                    shard_idx += 1
+                    gc.collect()
+
+            # Flush remaining records (< SHARD_SIZE)
+            if chunk:
+                shard_path = str(shard_dir / f"shard_{shard_idx:04d}")
+                Dataset.from_list(chunk).save_to_disk(shard_path)
+                shard_paths.append(shard_path)
+                total_encoded += len(chunk)
+                logger.info(
+                    f"[FeatureEng] Shard {shard_idx} flushed (final) → "
+                    f"{shard_path} ({len(chunk)} records, total={total_encoded})"
+                )
+                chunk = []
+                gc.collect()
+
+        except Exception as e:
+            return self._fail(f"Chunked shard encoding failed: {type(e).__name__}: {e}")
+
+        if not shard_paths:
             diag = getattr(self, "_last_encode_diagnostics", {})
             detail = ""
             if diag.get("no_image_count"):
@@ -276,15 +312,27 @@ class FeatureEngineeringAgent:
                 detail = f" Sample errors: {diag['error_samples']}"
             return self._fail(f"Encoding produced no valid records.{detail}")
 
-        # Split the already Arrow-backed (memory-mapped) dataset via index
-        # ranges — .select() does not load the whole dataset into RAM, so
-        # this is safe even for large pixel_values columns.
-        n = len(full_ds)
+        # Concatenate shards from disk (memory-mapped — no RAM spike)
+        from datasets import load_from_disk
+        shard_datasets = [load_from_disk(p) for p in shard_paths]
+        full_ds = concatenate_datasets(shard_datasets)
+        logger.info(f"[FeatureEng] All {len(shard_paths)} shards concatenated → {len(full_ds)} total records")
+
+        # Split into train/val by index (no data copied into RAM)
+        n     = len(full_ds)
         split = max(1, int(n * 0.9))
         train_ds = full_ds.select(range(split))
         val_ds   = full_ds.select(range(split, n)) if split < n else full_ds.select(range(max(0, n - 1), n))
 
         saved_path = self._save_to_disk(train_ds, val_ds, feature_path, target_meta)
+
+        # Clean up temp shards after successful save
+        import shutil as _shutil
+        try:
+            _shutil.rmtree(str(shard_dir), ignore_errors=True)
+            logger.info(f"[FeatureEng] Temp shards cleaned up.")
+        except Exception:
+            pass
         logger.info(
             f"[FeatureEng] Done. Train={len(train_ds)}  Val={len(val_ds)}  Path={saved_path}"
         )
@@ -487,7 +535,8 @@ class FeatureEngineeringAgent:
     # Values are chosen to fit comfortably on T4-class VRAM at typical batch sizes.
     # Add/update entries here when adding new model families to MODEL_CATALOGUE.
     _MAX_LEN_CEILING: Dict[str, int] = {
-        "qwen_vl":      1024,
+        "qwen_vl":      512,   # FIX: 1024 caused image-token mismatch (patch tokens > max_length);
+                                  # 512 fits within T4 VRAM and avoids mid-image truncation.
         "llava":        1024,
         "instructblip":  512,
         "blip2":         512,
@@ -496,7 +545,7 @@ class FeatureEngineeringAgent:
         "seq2seq":       256,
         "causal":        512,
     }
-    _DEFAULT_MAX_LEN_CEILING = 1024
+    _DEFAULT_MAX_LEN_CEILING = 512
 
     def _resolve_effective_max_len(
         self, records: List[Dict], processor, model_family: str, max_len: int,
@@ -1022,6 +1071,26 @@ class FeatureEngineeringAgent:
     def _encode_qwen_vl(self, question, answer, image, processor, max_len) -> Dict:
         tok = getattr(processor, "tokenizer", processor)
         min_answer_tokens = 4
+
+        # FIX: resize image to 448×448 BEFORE encoding to prevent Qwen2-VL's
+        # fast processor from generating more patch tokens than max_length.
+        # At 448×448 the model produces ≤256 image tokens (well within 512).
+        # The mismatch error "Got ids=[1009] and text=[1702]" happens because
+        # high-res images (e.g. 2000×1333) expand to 1700+ patch tokens;
+        # truncation then cuts input_ids but the text placeholder count stays
+        # at 1700, causing the validator to reject every such record.
+        if image is not None:
+            try:
+                from PIL import Image as _PILImage
+                # Only resize if larger than target — never upscale
+                MAX_SIDE = 448
+                w, h = image.size
+                if w > MAX_SIDE or h > MAX_SIDE:
+                    ratio = min(MAX_SIDE / w, MAX_SIDE / h)
+                    new_w, new_h = max(1, int(w * ratio)), max(1, int(h * ratio))
+                    image = image.resize((new_w, new_h), _PILImage.LANCZOS)
+            except Exception as e:
+                logger.debug(f"[FeatureEng] qwen_vl image resize skipped: {e}")
 
         if image is not None and hasattr(processor, "apply_chat_template"):
             messages = [{"role": "user", "content": [
