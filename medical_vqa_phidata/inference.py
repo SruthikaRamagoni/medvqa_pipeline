@@ -101,6 +101,7 @@ def run_inference(
 
     # ── Generate ──────────────────────────────────────────────────────────────
     answer = _generate(model, processor, prompt, image, device,
+                    question=question,
                         max_new_tokens, temperature, do_sample)
     logger.info(f"[Inference] answer: {answer}")
     return answer
@@ -140,6 +141,7 @@ def run_batch_inference(
 
         prompt = _build_prompt(question, hf_id, has_image=image is not None)
         answer = _generate(model, processor, prompt, image, device,
+                    question=question,
                             max_new_tokens, 0.3, False)
         results.append({"image_path": img_path, "question": question, "answer": answer})
 
@@ -172,18 +174,40 @@ def _load_model(hf_id: str, device: str):
     dtype = torch.float16 if device == "cuda" else torch.float32
     load_kw = dict(pretrained_model_name_or_path=hf_id, trust_remote_code=True, torch_dtype=dtype)
     if device == "cuda":
-        load_kw["device_map"] = "auto"
+        load_kw["device_map"] = {"": 0}  # FIX: "auto" triggers DataParallel on dual-T4 → use single GPU
 
     model = None
-    for cls_name in ["AutoModelForVision2Seq", "AutoModelForCausalLM", "AutoModelForSeq2SeqLM"]:
+    hid_lower = hf_id.lower()
+    if "qwen2.5-vl" in hid_lower:
+        class_order = ["Qwen2_5_VLForConditionalGeneration",
+                       "AutoModelForVision2Seq", "AutoModelForCausalLM"]
+    elif "qwen2-vl" in hid_lower:
+        class_order = ["Qwen2VLForConditionalGeneration",
+                       "AutoModelForVision2Seq", "AutoModelForCausalLM"]
+    else:
+        class_order = ["AutoModelForVision2Seq", "AutoModelForCausalLM", "AutoModelForSeq2SeqLM"]
+
+    for cls_name in class_order:
         try:
             import transformers as tf
             cls = getattr(tf, cls_name, None)
+            if cls is None:
+                try:
+                    import importlib
+                    submod = {
+                        "Qwen2_5_VLForConditionalGeneration": "transformers.models.qwen2_5_vl",
+                        "Qwen2VLForConditionalGeneration":    "transformers.models.qwen2_vl",
+                    }.get(cls_name)
+                    if submod:
+                        cls = getattr(importlib.import_module(submod), cls_name, None)
+                except Exception:
+                    pass
             if cls:
                 model = cls.from_pretrained(**load_kw)
                 logger.info(f"[Inference] Loaded with {cls_name}")
                 break
-        except Exception:
+        except Exception as e:
+            logger.debug(f"[Inference] {cls_name} failed: {e}")
             continue
 
     if model is None:
@@ -235,8 +259,49 @@ def _build_prompt(question: str, hf_id: str, has_image: bool) -> str:
     return f"Question: {question}\nAnswer:"
 
 
+_BINARY_INF_STARTS = (
+    "is ","are ","was ","were ","does ","do ","did ","has ","have ",
+    "can ","could ","should ","will ","would ","any ","is there",
+)
+
+def _is_binary_q(q: str) -> bool:
+    return any(q.lower().strip().startswith(p) for p in _BINARY_INF_STARTS)
+
+
+def _constrained_gen_kwargs(question: str, tok, do_sample: bool, max_new_tokens: int,
+                              temperature: float, pad_id) -> dict:
+    """Build generate() kwargs, adding binary constraints for yes/no questions."""
+    kw = dict(max_new_tokens=max_new_tokens,
+               temperature=temperature if do_sample else 1.0,
+               do_sample=do_sample,
+               pad_token_id=pad_id)
+    if _is_binary_q(question):
+        try:
+            yes_ids = tok.encode("yes", add_special_tokens=False)
+            no_ids  = tok.encode("no",  add_special_tokens=False)
+            if yes_ids and no_ids:
+                kw["force_words_ids"] = [yes_ids, no_ids]
+                kw["num_beams"] = 2
+        except Exception:
+            pass
+    return kw
+
+
+def _postprocess(text: str, question: str) -> str:
+    """Normalize output; for binary questions snap to yes/no."""
+    text = text.strip()
+    if _is_binary_q(question):
+        tl = text.lower().rstrip(".")
+        if tl.startswith("yes"):
+            return "yes"
+        if tl.startswith("no"):
+            return "no"
+    return text
+
+
 def _generate(model, processor, prompt, image, device,
-              max_new_tokens, temperature, do_sample) -> str:
+              max_new_tokens, temperature, do_sample,
+              question: str = "") -> str:
     import torch
     with torch.no_grad():
         try:
@@ -249,22 +314,21 @@ def _generate(model, processor, prompt, image, device,
                     inputs = processor(text=text, images=[image], return_tensors="pt").to(device)
                 else:
                     inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
-                out = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                                      temperature=temperature if do_sample else 1.0,
-                                      do_sample=do_sample)
-                gen = out[0][inputs["input_ids"].shape[-1]:]
                 tok = getattr(processor, "tokenizer", processor)
-                return tok.decode(gen, skip_special_tokens=True).strip()
+                pad_id = getattr(tok, "pad_token_id", None) or getattr(tok, "eos_token_id", 1)
+                kw = _constrained_gen_kwargs(question or prompt, tok, do_sample, max_new_tokens, temperature, pad_id)
+                out = model.generate(**inputs, **kw)
+                gen = out[0][inputs["input_ids"].shape[-1]:]
+                return _postprocess(tok.decode(gen, skip_special_tokens=True), question or prompt)
             else:
                 tok    = getattr(processor, "tokenizer", processor)
                 inputs = tok(prompt, return_tensors="pt",
                              truncation=True, max_length=512).to(device)
-                out = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                                      temperature=temperature if do_sample else 1.0,
-                                      do_sample=do_sample,
-                                      pad_token_id=getattr(tok, "eos_token_id", 1))
+                pad_id = getattr(tok, "eos_token_id", 1)
+                kw = _constrained_gen_kwargs(question or prompt, tok, do_sample, max_new_tokens, temperature, pad_id)
+                out = model.generate(**inputs, **kw)
                 gen = out[0][inputs["input_ids"].shape[-1]:]
-                return tok.decode(gen, skip_special_tokens=True).strip()
+                return _postprocess(tok.decode(gen, skip_special_tokens=True), question or prompt)
         except Exception as e:
             logger.error(f"[Inference] Generation error: {e}")
             return f"[Error: {e}]"
