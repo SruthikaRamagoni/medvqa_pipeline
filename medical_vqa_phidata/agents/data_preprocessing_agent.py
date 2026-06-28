@@ -130,7 +130,20 @@ class DataPreprocessingAgent:
         return fixed
 
     def _resize_images(self, records: List[Dict]) -> List[Dict]:
-        """Resize all found images to TARGET_SIZE and save to processed dir."""
+        """
+        Validate images are loadable and convert to RGB.
+        
+        FIX: Previously this resized all images to 224×224 (TARGET_SIZE) before
+        saving. This was destructive — Qwen2-VL and Qwen2.5-VL use dynamic
+        resolution encoding that produces far better visual features from
+        high-resolution images. Forcing 224×224 discards detail that the model's
+        patch tokeniser would otherwise preserve, directly harming accuracy on
+        fine-grained medical questions (e.g. "Is there a small lesion?").
+        
+        The processor for each model family handles its own resizing internally.
+        Preprocessing should only ensure the image is readable as RGB — not
+        impose a fixed resolution.
+        """
         try:
             from PIL import Image
             img_dir = PROCESSED_DIR / "images"
@@ -140,16 +153,18 @@ class DataPreprocessingAgent:
                 img_path = rec.get("image_path", "")
                 if img_path and Path(img_path).exists():
                     try:
-                        img = Image.open(img_path).convert("RGB").resize(TARGET_SIZE, Image.LANCZOS)
+                        # Load and re-save as PNG to ensure consistent format,
+                        # but at ORIGINAL resolution — no resize applied.
+                        img = Image.open(img_path).convert("RGB")
                         out = img_dir / f"img_{i:06d}.png"
                         img.save(out)
                         rec = {**rec, "image_path": str(out)}
                     except Exception as e:
-                        logger.debug(f"Resize failed {img_path}: {e}")
+                        logger.debug(f"Image re-save failed {img_path}: {e}")
                 result.append(rec)
             return result
         except ImportError:
-            logger.warning("Pillow not available, skipping resize.")
+            logger.warning("Pillow not available, skipping image processing.")
             return records
 
     def _clean_record(self, rec: Dict) -> Dict:
