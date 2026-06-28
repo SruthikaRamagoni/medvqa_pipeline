@@ -312,22 +312,51 @@ class FeatureEngineeringAgent:
                 detail = f" Sample errors: {diag['error_samples']}"
             return self._fail(f"Encoding produced no valid records.{detail}")
 
-        # Concatenate shards from disk (memory-mapped — no RAM spike)
+        # ── DISK-EFFICIENT SPLIT: avoid re-saving all data ──────────────────────
+        # The shards are already written to disk. Re-concatenating and calling
+        # save_to_disk() again would write a second full copy, doubling disk
+        # usage and causing OSError: [Errno 28] No space left on device.
+        #
+        # Instead: load each shard as a memory-mapped Dataset (zero copy),
+        # compute the 90/10 train/val split at the shard boundary, then use
+        # _save_to_disk_from_shards() which moves/copies individual Arrow
+        # files rather than re-encoding pixel_values from scratch.
         from datasets import load_from_disk
-        shard_datasets = [load_from_disk(p) for p in shard_paths]
-        full_ds = concatenate_datasets(shard_datasets)
-        logger.info(f"[FeatureEng] All {len(shard_paths)} shards concatenated → {len(full_ds)} total records")
+        import shutil as _shutil
 
-        # Split into train/val by index (no data copied into RAM)
-        n     = len(full_ds)
-        split = max(1, int(n * 0.9))
-        train_ds = full_ds.select(range(split))
-        val_ds   = full_ds.select(range(split, n)) if split < n else full_ds.select(range(max(0, n - 1), n))
+        shard_datasets = [load_from_disk(p) for p in shard_paths]
+        logger.info(f"[FeatureEng] All {len(shard_paths)} shards loaded (memory-mapped) → "
+                    f"{sum(len(s) for s in shard_datasets)} total records")
+
+        # Count total encoded records
+        total_n = sum(len(s) for s in shard_datasets)
+        split   = max(1, int(total_n * 0.9))
+
+        # Assign whole shards to train/val buckets — no within-shard slice
+        # needed for the vast majority of splits (split falls on a shard
+        # boundary ± SHARD_SIZE at most). For the one shard that straddles
+        # the split boundary we do a single cheap .select() on that shard only.
+        train_shards, val_shards = [], []
+        running = 0
+        for ds in shard_datasets:
+            shard_end = running + len(ds)
+            if shard_end <= split:
+                train_shards.append(ds)
+            elif running >= split:
+                val_shards.append(ds)
+            else:
+                # This shard straddles the split — slice it
+                cut = split - running
+                train_shards.append(ds.select(range(cut)))
+                val_shards.append(ds.select(range(cut, len(ds))))
+            running = shard_end
+
+        train_ds = concatenate_datasets(train_shards) if len(train_shards) > 1 else train_shards[0]
+        val_ds   = concatenate_datasets(val_shards)   if len(val_shards)   > 1 else (val_shards[0] if val_shards else train_shards[-1].select(range(max(0, len(train_shards[-1])-1), len(train_shards[-1]))))
 
         saved_path = self._save_to_disk(train_ds, val_ds, feature_path, target_meta)
 
-        # Clean up temp shards after successful save
-        import shutil as _shutil
+        # Clean up temp shards only after successful save
         try:
             _shutil.rmtree(str(shard_dir), ignore_errors=True)
             logger.info(f"[FeatureEng] Temp shards cleaned up.")
@@ -1300,27 +1329,84 @@ class FeatureEngineeringAgent:
 
     # ── HuggingFace Dataset / cache persistence ────────────────────────────────
 
+    @staticmethod
+    def _arrow_files_of(ds) -> list:
+        """Return the underlying Arrow file paths for a memory-mapped Dataset, or []."""
+        try:
+            # datasets ≥ 2.x stores cache files in ds.cache_files
+            return [cf["filename"] for cf in ds.cache_files if cf.get("filename")]
+        except Exception:
+            return []
+
     def _save_to_disk(self, train_ds, val_ds, feature_path: str, meta: Dict[str, Any]) -> str:
-        import time
+        """Write train/ and val/ splits to feature_path.
+
+        DISK-EFFICIENT PATH: if the dataset is already memory-mapped from
+        Arrow files on disk (i.e. came from our shard pipeline), we copy
+        only those Arrow files + a minimal dataset_info.json instead of
+        re-encoding pixel_values. This avoids the second full-dataset write
+        that caused OSError: [Errno 28] No space left on device.
+        """
+        import time, shutil as _shutil, json as _json
         base_path = Path(feature_path)
         base_path.mkdir(parents=True, exist_ok=True)
-
-        logger.info(
-            f"[FeatureEng] Saving to disk — train={len(train_ds)} "
-            f"val={len(val_ds)} records (this can take a while for "
-            f"vision datasets with pixel_values; no per-shard progress is "
-            f"logged by datasets.save_to_disk itself, so a multi-minute "
-            f"gap here is expected for larger datasets, not a hang)."
-        )
         t0 = time.time()
-        train_ds.save_to_disk(str(base_path / "train"))
-        logger.info(f"[FeatureEng] train/ saved in {time.time() - t0:.1f}s")
+
+        def _fast_copy_split(ds, dest_name: str) -> bool:
+            """Try to copy Arrow files directly. Returns True on success."""
+            dest = base_path / dest_name
+            dest.mkdir(parents=True, exist_ok=True)
+            arrow_files = self._arrow_files_of(ds)
+            if not arrow_files:
+                return False
+            try:
+                for i, src_file in enumerate(arrow_files):
+                    src_path = Path(src_file)
+                    if not src_path.exists():
+                        return False
+                    _shutil.copy2(str(src_path), str(dest / f"data-{i:05d}-of-{len(arrow_files):05d}.arrow"))
+                # Write the minimal metadata datasets needs to load_from_disk()
+                info = ds.info.to_dict() if hasattr(ds.info, "to_dict") else {}
+                info["num_rows"] = len(ds)
+                (dest / "dataset_info.json").write_text(_json.dumps(info, indent=2, default=str))
+                # state.json is checked by some versions of datasets
+                state = {"_data_files": [{"filename": f"data-{i:05d}-of-{len(arrow_files):05d}.arrow"}
+                                          for i in range(len(arrow_files))],
+                         "_fingerprint": getattr(ds, "_fingerprint", "unknown"),
+                         "_format_columns": None,
+                         "_format_kwargs": {},
+                         "_format_type": None,
+                         "_output_all_columns": False,
+                         "_split": None}
+                (dest / "state.json").write_text(_json.dumps(state, indent=2))
+                return True
+            except Exception as e:
+                logger.warning(f"[FeatureEng] Fast Arrow copy failed for {dest_name}: {e} — falling back to save_to_disk")
+                _shutil.rmtree(str(dest), ignore_errors=True)
+                return False
+
+        # Try fast path first (Arrow file copy), fall back to full re-encode
+        train_fast = _fast_copy_split(train_ds, "train")
+        if not train_fast:
+            logger.info(
+                f"[FeatureEng] Writing train/ via save_to_disk — {len(train_ds)} records "
+                f"(may take several minutes for vision datasets)."
+            )
+            train_ds.save_to_disk(str(base_path / "train"))
+        logger.info(f"[FeatureEng] train/ ready in {time.time() - t0:.1f}s "
+                    f"({'fast copy' if train_fast else 'save_to_disk'})")
 
         t1 = time.time()
-        val_ds.save_to_disk(str(base_path / "val"))
-        logger.info(f"[FeatureEng] val/ saved in {time.time() - t1:.1f}s")
+        val_fast = _fast_copy_split(val_ds, "val")
+        if not val_fast:
+            logger.info(
+                f"[FeatureEng] Writing val/ via save_to_disk — {len(val_ds)} records."
+            )
+            val_ds.save_to_disk(str(base_path / "val"))
+        logger.info(f"[FeatureEng] val/ ready in {time.time() - t1:.1f}s "
+                    f"({'fast copy' if val_fast else 'save_to_disk'})")
 
-        (base_path / "metadata.json").write_text(json.dumps(meta, indent=2, default=str))
+        (base_path / "metadata.json").write_text(_json.dumps(meta, indent=2, default=str))
         logger.info(
             f"[FeatureEng] Saved to {base_path} (metadata.json written) — "
             f"total save time {time.time() - t0:.1f}s"
